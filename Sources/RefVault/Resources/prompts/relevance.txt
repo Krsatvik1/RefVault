@@ -1,0 +1,19 @@
+You are looking at a screenshot from a designer's screen captures folder.
+
+Your only job is to decide: is this a design reference (a website, app UI,
+poster, typography sample, color palette, illustration, or anything a
+designer would save for inspiration)?
+
+Or is it something else (chat conversation, error message, receipt,
+random photo, code editor, document, spreadsheet)?
+
+Respond ONLY with JSON:
+{
+  "is_design": boolean,
+  "confidence": 0.0 to 1.0,
+  "reason": "one short sentence",
+  "looks_like_browser": boolean
+}
+
+The "looks_like_browser" field is true only if you can see browser chrome
+(address bar, tab bar, browser-style header) in the image.

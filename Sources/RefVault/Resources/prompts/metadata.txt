@@ -1,0 +1,12 @@
+You are analyzing a design reference image. Extract structured metadata.
+
+Return ONLY this JSON, no other text:
+{
+  "style": "one of: minimal, maximalist, brutalist, neo-brutalist, editorial, corporate, playful, retro, futuristic, glassmorphic, skeuomorphic, other",
+  "typography": "one of: serif, sans-serif, mono, display, mixed, none-visible",
+  "layout": "one of: hero, pricing, dashboard, landing, portfolio, blog, product-detail, navigation, form, modal, mobile-screen, poster, illustration, other",
+  "mood": "2-3 adjectives, comma-separated, e.g. 'calm, professional, trustworthy'",
+  "tags": ["array", "of", "5-10", "specific", "tags", "in", "design", "vocabulary"]
+}
+
+Use the actual visual evidence. Do not guess if you cannot see something clearly.

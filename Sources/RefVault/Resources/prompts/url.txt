@@ -1,0 +1,15 @@
+Look ONLY at this image's header area, address bar, or any visible URL text.
+
+Is there a clearly readable website URL visible in the image?
+
+Respond ONLY with JSON:
+{
+  "url": "the.url.com/path or null",
+  "found_in": "address-bar or header-text or footer or null"
+}
+
+Rules:
+- Only return a URL if you can clearly read it character by character
+- Do NOT guess based on the visual style of the site
+- Do NOT infer the URL from a logo
+- If unsure, return null for both fields

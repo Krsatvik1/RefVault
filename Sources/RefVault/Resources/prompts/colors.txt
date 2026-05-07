@@ -1,0 +1,16 @@
+Identify the dominant colors in this design.
+
+Return ONLY this JSON:
+{
+  "primary": "#RRGGBB",
+  "secondary": "#RRGGBB",
+  "accent": "#RRGGBB",
+  "all": ["#RRGGBB", "#RRGGBB"]
+}
+
+Primary: the most-used color (often background or main surface).
+Secondary: the next most-used color (often text or contrasting surface).
+Accent: a color used sparingly for emphasis (buttons, links, highlights).
+All: up to 6 hex codes representing the full palette in order of dominance.
+
+Approximate hex codes are acceptable. Be honest about what you see.
