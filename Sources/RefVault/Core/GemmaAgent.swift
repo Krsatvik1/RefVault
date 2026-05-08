@@ -29,19 +29,23 @@ struct GemmaAgent {
 
     /// Runs the agent over an image at `url` and returns the merged result.
     /// `onEvent` lets callers render progress as the pipeline streams.
+    /// Pass `model` to run against a model other than the agent's default —
+    /// used by the debug A/B comparison view.
     @discardableResult
     func run(
         imageAt url: URL,
+        model: String? = nil,
         onEvent: @escaping @Sendable (Event) -> Void = { _ in }
     ) async throws -> AgentResult {
         let imageBase64 = try ImageEncoder.loadAndEncode(from: url)
+        let activeClient: OllamaClient = model.map { client.withModel($0) } ?? client
 
         // ── Step 1: relevance gate ──────────────────────────────────────────
         onEvent(.startedRelevance)
         let relevance: RelevanceVerdict
         do {
             let prompt = try PromptStore.load("relevance")
-            let (decoded, _) = try await client.generateJSON(
+            let (decoded, _) = try await activeClient.generateJSON(
                 prompt: prompt,
                 imageBase64: imageBase64,
                 as: RelevanceVerdict.self
@@ -69,15 +73,17 @@ struct GemmaAgent {
         onEvent(.startedExtraction)
 
         async let metadataResult: DesignMetadata? = runMetadata(
+            client: activeClient,
             imageBase64: imageBase64,
             onEvent: onEvent
         )
         async let paletteResult: ColorPalette? = runPalette(
+            client: activeClient,
             imageBase64: imageBase64,
             onEvent: onEvent
         )
         async let urlResult: VisibleURL? = relevance.looksLikeBrowser
-            ? runURL(imageBase64: imageBase64, onEvent: onEvent)
+            ? runURL(client: activeClient, imageBase64: imageBase64, onEvent: onEvent)
             : nil
 
         let (metadata, palette, visibleURL) = await (
@@ -97,6 +103,7 @@ struct GemmaAgent {
     // ── Per-tool helpers ────────────────────────────────────────────────────
 
     private func runMetadata(
+        client: OllamaClient,
         imageBase64: String,
         onEvent: @Sendable (Event) -> Void
     ) async -> DesignMetadata? {
@@ -116,6 +123,7 @@ struct GemmaAgent {
     }
 
     private func runPalette(
+        client: OllamaClient,
         imageBase64: String,
         onEvent: @Sendable (Event) -> Void
     ) async -> ColorPalette? {
@@ -135,6 +143,7 @@ struct GemmaAgent {
     }
 
     private func runURL(
+        client: OllamaClient,
         imageBase64: String,
         onEvent: @Sendable (Event) -> Void
     ) async -> VisibleURL? {

@@ -6,17 +6,37 @@ import Foundation
 /// Vision models accept a `images` field of base64-encoded image strings.
 struct OllamaClient {
     let baseURL: URL
-    let model: String
+    var model: String
     let session: URLSession
 
     init(
         baseURL: URL = URL(string: "http://localhost:11434")!,
-        model: String = "gemma4:26b",
+        model: String = OllamaClient.defaultModel,
         session: URLSession = .shared
     ) {
         self.baseURL = baseURL
         self.model = model
         self.session = session
+    }
+
+    /// Default model used when no override is supplied. The lighter `e4b`
+    /// variant runs comfortably on a 24GB-RAM Mac. Swap to `gemma4:26b` for
+    /// higher-quality but slower runs.
+    static let defaultModel = "gemma4:e4b"
+
+    /// All gemma4 tags the UI knows about. Surfaced in the debug picker so
+    /// the user can A/B between sizes.
+    static let knownGemmaModels: [String] = [
+        "gemma4:e4b",
+        "gemma4:e2b",
+        "gemma4:26b"
+    ]
+
+    /// Returns a copy of this client configured to talk to a different model.
+    func withModel(_ name: String) -> OllamaClient {
+        var copy = self
+        copy.model = name
+        return copy
     }
 
     /// Health check — returns the list of locally pulled model tags.

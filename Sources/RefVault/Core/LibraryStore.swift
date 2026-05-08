@@ -89,6 +89,25 @@ final class LibraryStore: ObservableObject {
         return record
     }
 
+    /// Replace an existing record's agent-derived fields (relevance, metadata,
+    /// palette, URL). Keeps id, file paths, and capture/index dates. Used by
+    /// the debug regenerate flow.
+    @discardableResult
+    func update(record: ScreenshotRecord, with result: AgentResult) -> ScreenshotRecord? {
+        guard let idx = records.firstIndex(where: { $0.id == record.id }) else {
+            return nil
+        }
+        var updated = records[idx]
+        updated.relevance = result.relevance
+        updated.metadata = result.metadata
+        updated.palette = result.palette
+        updated.visibleURL = result.visibleURL
+        updated.indexedAt = Date()
+        records[idx] = updated
+        persist()
+        return updated
+    }
+
     func delete(_ record: ScreenshotRecord) {
         if let url = storedImageURL(for: record) {
             try? FileManager.default.removeItem(at: url)

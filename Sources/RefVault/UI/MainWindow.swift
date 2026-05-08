@@ -62,8 +62,11 @@ struct MainWindow: View {
         let client = coordinator.agent.client
         do {
             let models = try await client.listModels()
-            if models.contains(where: { $0.hasPrefix("gemma4") }) {
-                modelStatus = "Ollama OK · gemma4"
+            let gemma4 = models.filter { $0.hasPrefix("gemma4") }
+            if gemma4.contains(client.model) {
+                modelStatus = "Ollama OK · \(client.model)"
+            } else if !gemma4.isEmpty {
+                modelStatus = "Ollama OK · default \(client.model) not pulled (have: \(gemma4.joined(separator: ", ")))"
             } else if models.isEmpty {
                 modelStatus = "Ollama OK · no models"
             } else {
