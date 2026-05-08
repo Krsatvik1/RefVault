@@ -3,14 +3,15 @@ import Foundation
 /// The agentic loop that runs over a single screenshot.
 ///
 /// Step 1 — relevance gate. If `is_design == false`, we exit early with a
-/// minimal record. No further Ollama calls.
+/// minimal result. No further Ollama calls.
 ///
 /// Step 2 — three extractors run in parallel: design metadata, color palette,
 /// and (if the image looks like a browser) the visible URL. Independence is
 /// what makes parallelism safe; Ollama on M-series Macs handles concurrent
 /// requests without blowing up.
 ///
-/// Step 3 — merge into one ScreenshotRecord and return.
+/// Step 3 — merge into one AgentResult and return. Persistence (file copy,
+/// dimensions, ID assignment) is the caller's job.
 struct GemmaAgent {
     let client: OllamaClient
 
@@ -22,19 +23,18 @@ struct GemmaAgent {
         case metadata(DesignMetadata)
         case palette(ColorPalette)
         case visibleURL(VisibleURL)
-        case finished(ScreenshotRecord)
+        case finished(AgentResult)
         case failed(Error, stage: String)
     }
 
-    /// Runs the agent over an image at `url` and returns the merged record.
-    /// `onEvent` lets the UI render progress as the pipeline streams.
-    func index(
+    /// Runs the agent over an image at `url` and returns the merged result.
+    /// `onEvent` lets callers render progress as the pipeline streams.
+    @discardableResult
+    func run(
         imageAt url: URL,
         onEvent: @escaping @Sendable (Event) -> Void = { _ in }
-    ) async throws -> ScreenshotRecord {
+    ) async throws -> AgentResult {
         let imageBase64 = try ImageEncoder.loadAndEncode(from: url)
-        let captured = (try? FileManager.default
-            .attributesOfItem(atPath: url.path)[.creationDate] as? Date) ?? Date()
 
         // ── Step 1: relevance gate ──────────────────────────────────────────
         onEvent(.startedRelevance)
@@ -55,17 +55,14 @@ struct GemmaAgent {
 
         // Early exit: not a design reference.
         guard relevance.isDesign else {
-            let record = ScreenshotRecord(
-                filePath: url.path,
-                capturedAt: captured,
-                indexedAt: Date(),
+            let result = AgentResult(
                 relevance: relevance,
                 metadata: nil,
                 palette: nil,
                 visibleURL: nil
             )
-            onEvent(.finished(record))
-            return record
+            onEvent(.finished(result))
+            return result
         }
 
         // ── Step 2: parallel extraction ─────────────────────────────────────
@@ -87,17 +84,14 @@ struct GemmaAgent {
             metadataResult, paletteResult, urlResult
         )
 
-        let record = ScreenshotRecord(
-            filePath: url.path,
-            capturedAt: captured,
-            indexedAt: Date(),
+        let result = AgentResult(
             relevance: relevance,
             metadata: metadata,
             palette: palette,
             visibleURL: visibleURL
         )
-        onEvent(.finished(record))
-        return record
+        onEvent(.finished(result))
+        return result
     }
 
     // ── Per-tool helpers ────────────────────────────────────────────────────

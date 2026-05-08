@@ -1,19 +1,30 @@
 You are looking at a screenshot from a designer's screen captures folder.
 
-Your only job is to decide: is this a design reference (a website, app UI,
-poster, typography sample, color palette, illustration, or anything a
-designer would save for inspiration)?
+Decide three things:
+1. Is this a design reference (a website, app UI, poster, typography sample,
+   illustration, color palette, or anything a designer would save for inspiration)?
+   It is NOT design if it's a chat, error, receipt, code editor, document,
+   spreadsheet, or random photo.
+2. What surface is it? One of:
+   "website" | "app" | "poster" | "illustration" | "document" | "other"
+3. What device is the design intended for? One of:
+   "desktop" | "mobile" | "tablet" | "other"
 
-Or is it something else (chat conversation, error message, receipt,
-random photo, code editor, document, spreadsheet)?
-
-Respond ONLY with JSON:
+Respond ONLY with this JSON, no other text:
 {
   "is_design": boolean,
   "confidence": 0.0 to 1.0,
   "reason": "one short sentence",
-  "looks_like_browser": boolean
+  "looks_like_browser": boolean,
+  "surface": "website" | "app" | "poster" | "illustration" | "document" | "other",
+  "device": "desktop" | "mobile" | "tablet" | "other"
 }
 
-The "looks_like_browser" field is true only if you can see browser chrome
-(address bar, tab bar, browser-style header) in the image.
+Rules:
+- "looks_like_browser" is true only if you can see browser chrome
+  (address bar, tab bar, browser-style header) in the image.
+- For non-design images set is_design=false but still answer surface
+  and device based on what is shown ("other" is acceptable).
+- Mobile = tall narrow aspect, phone-style UI (status bar, bottom tab bar,
+  iOS/Android shell). Desktop = wide layout with sidebars or browser chrome.
+  Tablet = in-between iPad-style layout.

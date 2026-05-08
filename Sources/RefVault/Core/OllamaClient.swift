@@ -78,18 +78,23 @@ struct OllamaClient {
             let images: [String]
             let stream: Bool
             let format: String
+            let think: Bool
             let options: [String: Double]
         }
         struct GenerateResponse: Decodable {
             let response: String
         }
 
+        // Gemma 4 ships with "thinking" on by default — that produces a
+        // {"thought": "..."} preamble instead of the JSON we asked for.
+        // Disabling think + format=json gives us clean tool output.
         let body = GenerateRequest(
             model: model,
             prompt: prompt,
             images: [imageBase64],
             stream: false,
             format: "json",
+            think: false,
             options: ["temperature": temperature]
         )
 
