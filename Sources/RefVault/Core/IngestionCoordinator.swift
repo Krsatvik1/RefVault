@@ -74,13 +74,29 @@ final class IngestionCoordinator: ObservableObject {
     /// the dot color and verb ("saved" vs "refreshed").
     var onSaved: ((ScreenshotRecord, Double, ToastKind) -> Void)?
 
+    /// Fires when a dropped image was already in the library (exact-byte
+    /// or near-visual match). Carries the URL of the new file (so the
+    /// toast can show it as the highlighted "NEW" thumbnail), every
+    /// existing record it matched (for the thumb row), and the reason
+    /// for the dedup. The toast offers a "Save it regardless" CTA which
+    /// calls back into `enqueueBypassingDedup(_:)`.
+    var onDuplicate: ((URL, [ScreenshotRecord], DuplicateReason) -> Void)?
+
     enum ToastKind { case ingest, regenerate }
+    enum DuplicateReason { case exact, visual(hamming: Int) }
 
     private var processing = false
     /// Pending regenerate jobs, processed through the same pump as `pending`
     /// so we don't fan out parallel Ollama calls. Each entry is the record
     /// being re-evaluated and the URL of its stored image copy.
     private var pendingRegens: [(record: ScreenshotRecord, url: URL)] = []
+    /// URLs the user explicitly opted to save through the duplicate
+    /// toast's "Save it regardless" CTA. The dedup re-check inside
+    /// process() skips any URL in this set; without that, the user's
+    /// override would loop forever — process() would re-detect the
+    /// dup and re-fire onDuplicate, the toast would re-show, and the
+    /// agent run would never start.
+    private var dedupBypassURLs: Set<URL> = []
 
     private static let primaryModelKey = "refvault.primaryModel"
     private static let granularKey = "refvault.granularExtraction"
@@ -106,12 +122,19 @@ final class IngestionCoordinator: ObservableObject {
         self.agent.client.model = stored
     }
 
-    /// Add a URL to the ingestion queue. Skipped if already in the library
-    /// or already queued or currently in-flight.
+    /// Add a URL to the ingestion queue. Skipped if:
+    ///   1. exact same path is already a saved record (cheap, no I/O)
+    ///   2. SHA-256 of bytes matches an existing record (catches re-imports
+    ///      and Finder copies of the same file at a different path)
+    ///   3. perceptual hash is within Hamming threshold of an existing
+    ///      record (catches "same page, different tab open" / mid-animation)
+    ///   4. already queued or currently in-flight
+    /// Cases 2 + 3 fire the duplicate toast so the user gets feedback that
+    /// their drop was acknowledged.
     func enqueue(_ url: URL) {
         guard !store.contains(sourcePath: url.path) else {
             FileHandle.standardError.write(Data(
-                "[Queue] enqueue \(url.lastPathComponent) → SKIP (already in library)\n".utf8
+                "[Queue] enqueue \(url.lastPathComponent) → SKIP (already in library by path)\n".utf8
             ))
             return
         }
@@ -121,9 +144,51 @@ final class IngestionCoordinator: ObservableObject {
             ))
             return
         }
+
+        // Hash-based dedup. Both calls are pure pixel/byte math, no Ollama,
+        // no agent — so the cost here is bounded (~10ms SHA + ~30ms dHash
+        // worst case) regardless of library size.
+        if let sha = PerceptualHash.sha256(of: url),
+           let dup = store.findExactDuplicate(sha: sha) {
+            FileHandle.standardError.write(Data(
+                "[Queue] enqueue \(url.lastPathComponent) → SKIP (exact dup of \(dup.id.uuidString.prefix(8)))\n".utf8
+            ))
+            onDuplicate?(url, [dup], .exact)
+            return
+        }
+        if let phash = PerceptualHash.dHash(of: url) {
+            let matches = store.findVisualDuplicates(phash: phash, threshold: 6)
+            if let nearest = matches.first {
+                FileHandle.standardError.write(Data(
+                    "[Queue] enqueue \(url.lastPathComponent) → SKIP (visual dup of \(nearest.record.id.uuidString.prefix(8)), hamming=\(nearest.hamming), \(matches.count) total matches)\n".utf8
+                ))
+                onDuplicate?(url, matches.map(\.record), .visual(hamming: nearest.hamming))
+                return
+            }
+        }
+
         pending.append(url)
         FileHandle.standardError.write(Data(
             "[Queue] enqueue \(url.lastPathComponent) → ingest (depth ingest=\(pending.count) regen=\(pendingRegens.count) inFlight=\(inFlight != nil))\n".utf8
+        ))
+        Task { await pump() }
+    }
+
+    /// Skip the dedup gates and force-enqueue the URL. Called when the
+    /// user clicks "Save it regardless" on the duplicate toast.
+    /// Also marks the URL in `dedupBypassURLs` so process()'s race
+    /// re-check leaves it alone instead of looping back into onDuplicate.
+    func enqueueBypassingDedup(_ url: URL) {
+        guard !pending.contains(url), inFlight != url else {
+            FileHandle.standardError.write(Data(
+                "[Queue] bypass enqueue \(url.lastPathComponent) → SKIP (already queued / in-flight)\n".utf8
+            ))
+            return
+        }
+        dedupBypassURLs.insert(url)
+        pending.append(url)
+        FileHandle.standardError.write(Data(
+            "[Queue] bypass enqueue \(url.lastPathComponent) → ingest (dedup gates skipped, depth=\(pending.count))\n".utf8
         ))
         Task { await pump() }
     }
@@ -137,6 +202,33 @@ final class IngestionCoordinator: ObservableObject {
     /// Drop everything that has not started processing yet.
     func clearPending() {
         pending.removeAll()
+    }
+
+    /// Remove a queued regenerate from the queue. No-op if the record is
+    /// already in-flight (Ollama call is mid-stream and can't be cancelled
+    /// cleanly) or not present at all. Returns true if a queued job was
+    /// actually removed.
+    @discardableResult
+    func cancelRegenerate(_ record: ScreenshotRecord) -> Bool {
+        // Refuse if currently running. regenerateStartedAt[id] is set the
+        // moment the pump pulls a regen out of pendingRegens.
+        if regenerateStartedAt[record.id] != nil {
+            FileHandle.standardError.write(Data(
+                "[Queue] cancelRegenerate \(record.id.uuidString.prefix(8)) → SKIP (already in-flight)\n".utf8
+            ))
+            return false
+        }
+        let before = pendingRegens.count
+        pendingRegens.removeAll(where: { $0.record.id == record.id })
+        let removed = before - pendingRegens.count
+        if removed > 0 {
+            regeneratingIds.remove(record.id)
+            FileHandle.standardError.write(Data(
+                "[Queue] cancelRegenerate \(record.id.uuidString.prefix(8)) → removed from queue (depth regen=\(pendingRegens.count))\n".utf8
+            ))
+            return true
+        }
+        return false
     }
 
     /// Queue a record for regeneration. The agent will re-run the whole
@@ -214,6 +306,10 @@ final class IngestionCoordinator: ObservableObject {
 
     private func processRegen(record: ScreenshotRecord, url: URL) async {
         let started = Date()
+        // Backfill hashes whenever we regenerate. Pre-dedup library entries
+        // have nil hashes; this is the natural moment to fill them in.
+        let sha = PerceptualHash.sha256(of: url)
+        let phash = PerceptualHash.dHash(of: url)
         do {
             let result = try await agent.run(
                 imageAt: url,
@@ -225,7 +321,13 @@ final class IngestionCoordinator: ObservableObject {
             FileHandle.standardError.write(Data(
                 "[Toast] agent returned (regen) isDesign=\(result.relevance.isDesign) conf=\(String(format: "%.2f", result.relevance.confidence)) elapsed=\(String(format: "%.1fs", elapsed))\n".utf8
             ))
-            let updated = store.update(record: record, with: result, processingSeconds: elapsed)
+            let updated = store.update(
+                record: record,
+                with: result,
+                processingSeconds: elapsed,
+                fileHash: sha,
+                perceptualHash: phash
+            )
             appendLog(LogLine(
                 url: url,
                 outcome: "regenerated · \(result.relevance.surface) · conf \(formatted(result.relevance.confidence)) · \(String(format: "%.1fs", elapsed))",
@@ -254,6 +356,47 @@ final class IngestionCoordinator: ObservableObject {
 
     private func process(_ url: URL) async {
         let started = Date()
+
+        // Compute hashes up front. Cheap (~40ms total) and we'll need them
+        // both for the race-safe re-check below AND to persist on the
+        // saved record so future imports can dedup against this one.
+        let sha = PerceptualHash.sha256(of: url)
+        let phash = PerceptualHash.dHash(of: url)
+        FileHandle.standardError.write(Data(
+            "[Queue] hashes for \(url.lastPathComponent) sha=\(sha?.prefix(12) ?? "nil") phash=\(phash.map { String($0, radix: 16) } ?? "nil")\n".utf8
+        ))
+
+        // Race-safe re-check: between enqueue() and now, another item from
+        // the queue may have been saved. Re-run the dedup against current
+        // records before paying for the agent run — UNLESS the user
+        // explicitly opted to override via "Save it regardless", in which
+        // case we'd just loop back into onDuplicate forever.
+        let bypassed = dedupBypassURLs.contains(url)
+        if bypassed {
+            dedupBypassURLs.remove(url)
+            FileHandle.standardError.write(Data(
+                "[Queue] process \(url.lastPathComponent) → bypass active, skipping dedup re-check\n".utf8
+            ))
+        } else {
+            if let sha, let dup = store.findExactDuplicate(sha: sha) {
+                FileHandle.standardError.write(Data(
+                    "[Queue] process \(url.lastPathComponent) → SKIP (race-detected exact dup of \(dup.id.uuidString.prefix(8)))\n".utf8
+                ))
+                onDuplicate?(url, [dup], .exact)
+                return
+            }
+            if let phash {
+                let matches = store.findVisualDuplicates(phash: phash, threshold: 6)
+                if let nearest = matches.first {
+                    FileHandle.standardError.write(Data(
+                        "[Queue] process \(url.lastPathComponent) → SKIP (race-detected visual dup of \(nearest.record.id.uuidString.prefix(8)), hamming=\(nearest.hamming))\n".utf8
+                    ))
+                    onDuplicate?(url, matches.map(\.record), .visual(hamming: nearest.hamming))
+                    return
+                }
+            }
+        }
+
         do {
             let result = try await agent.run(
                 imageAt: url,
@@ -273,7 +416,9 @@ final class IngestionCoordinator: ObservableObject {
                 if let saved = store.saveRecord(
                     from: result,
                     sourceURL: url,
-                    processingSeconds: elapsed
+                    processingSeconds: elapsed,
+                    fileHash: sha,
+                    perceptualHash: phash
                 ) {
                     appendLog(LogLine(
                         url: url,

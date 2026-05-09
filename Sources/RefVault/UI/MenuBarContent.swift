@@ -26,14 +26,33 @@ struct MenuBarContent: View {
     }
 
     private var filteredRecords: [ScreenshotRecord] {
+        let base: [ScreenshotRecord]
         if let f = searchModel.parsedFilter, !f.isEmpty {
-            return store.search(filter: f)
+            base = store.search(filter: f)
+        } else {
+            base = store.records
         }
-        return store.records
+        let selected = searchModel.selectedTags
+        let tagFiltered: [ScreenshotRecord]
+        if selected.isEmpty {
+            tagFiltered = base
+        } else {
+            tagFiltered = base.filter { record in
+                let recordTags = Set(record.metadata?.tags ?? [])
+                let recordColors: Set<String> = Set(
+                    (record.palette?.all ?? []).flatMap { ColorNamer.families(for: $0) }
+                )
+                return selected.allSatisfy { sel in
+                    recordTags.contains(sel) || recordColors.contains(sel)
+                }
+            }
+        }
+        return searchModel.sorted(tagFiltered)
     }
 
     private var hasActiveFilters: Bool {
         if let f = searchModel.parsedFilter, !f.isEmpty { return true }
+        if !searchModel.selectedTags.isEmpty { return true }
         return false
     }
 
@@ -63,6 +82,7 @@ struct MenuBarContent: View {
                 menuBarStrip
                 searchField
                 filterRow
+                tagsRow
                 resultRail
                 Spacer(minLength: 0)
             }
@@ -365,6 +385,12 @@ struct MenuBarContent: View {
             }
             .padding(.trailing, 4)
 
+            // Selected chips from the tag/color filter row promote up
+            // into the FILTER row so all active filters live in one
+            // place. AI-parsed chips render after.
+            ForEach(Array(searchModel.selectedTags).sorted(), id: \.self) { tag in
+                selectedTagChip(tag)
+            }
             ForEach(activeChips) { chip in
                 filterChipView(chip)
             }
@@ -410,24 +436,189 @@ struct MenuBarContent: View {
                 .buttonStyle(.plain)
             }
 
-            HStack(spacing: 5) {
-                Text("SORT")
-                    .font(.system(size: 9, weight: .semibold))
-                    .foregroundColor(.white.opacity(0.45))
-                    .tracking(1)
-                Text("recent")
-                    .font(.system(size: 11))
+            // Plain Buttons inside Menu (not a Picker) — the prior
+            // Picker labelled "Sort" inside a button labelled "Sort"
+            // double-stacked the word and made the dropdown read like a
+            // submenu. Buttons render as a clean macOS-style menu list
+            // with checkmark on the active mode.
+            Menu {
+                ForEach(SearchModel.SortMode.allCases) { mode in
+                    Button {
+                        searchModel.sortMode = mode
+                    } label: {
+                        if searchModel.sortMode == mode {
+                            Label(mode.label.capitalized, systemImage: "checkmark")
+                        } else {
+                            Text(mode.label.capitalized)
+                        }
+                    }
+                }
+            } label: {
+                HStack(spacing: 5) {
+                    Text("SORT")
+                        .font(.system(size: 9, weight: .semibold))
+                        .foregroundColor(.white.opacity(0.45))
+                        .tracking(1)
+                    Text(searchModel.sortMode.label)
+                        .font(.system(size: 11))
+                        .foregroundColor(.white)
+                    Image(systemName: "chevron.down")
+                        .font(.system(size: 8, weight: .semibold))
+                        .foregroundColor(.white.opacity(0.6))
+                }
+                .padding(.horizontal, 9)
+                .padding(.vertical, 4)
+                .background(RoundedRectangle(cornerRadius: 8).fill(Color.white.opacity(0.05)))
+                .overlay(RoundedRectangle(cornerRadius: 8)
+                    .stroke(Color.white.opacity(0.10), lineWidth: 0.5))
+            }
+            .menuStyle(.borderlessButton)
+            .menuIndicator(.hidden)
+            .fixedSize()
+        }
+    }
+
+    // MARK: - Tag filter row (popover variant of LibraryView's tag chips)
+
+    @ViewBuilder
+    private var tagsRow: some View {
+        let allTags = store.vocabulary.tags
+        let available = allTags.filter { !searchModel.selectedTags.contains($0) }
+        HStack(spacing: 6) {
+            colorMenu
+            // Available-only here. Selected tags promoted up into the
+            // FILTER row so all active filters cluster together.
+            ScrollView(.horizontal, showsIndicators: false) {
+                HStack(spacing: 6) {
+                    ForEach(available, id: \.self) { tag in
+                        tagChip(tag, isSelected: false)
+                    }
+                }
+                .padding(.vertical, 1)
+            }
+        }
+        .frame(maxHeight: 28)
+    }
+
+    /// Promoted selected-tag chip rendered inside the FILTER row. Same
+    /// rose-pink fill as primary AI chips so they read as one visual
+    /// group, with × to remove.
+    @ViewBuilder
+    private func selectedTagChip(_ tag: String) -> some View {
+        Button {
+            searchModel.toggleTag(tag)
+        } label: {
+            HStack(spacing: 6) {
+                Text(tag)
+                    .font(.system(size: 12, weight: .medium))
                     .foregroundColor(.white)
+                Image(systemName: "xmark")
+                    .font(.system(size: 7, weight: .bold))
+                    .foregroundColor(.white.opacity(0.85))
+                    .frame(width: 14, height: 14)
+                    .background(Circle().fill(Color.white.opacity(0.10)))
+            }
+            .padding(.leading, 10)
+            .padding(.trailing, 6)
+            .padding(.vertical, 4)
+            .background(Capsule().fill(rosePrimary.opacity(0.85)))
+            .overlay(Capsule().stroke(rosePrimary.opacity(0.4), lineWidth: 0.5))
+        }
+        .buttonStyle(.plain)
+    }
+
+    private var colorMenu: some View {
+        Menu {
+            ForEach(ColorNamer.allFamilies, id: \.self) { fam in
+                Button {
+                    searchModel.toggleTag(fam)
+                } label: {
+                    Label {
+                        Text(fam.capitalized + (searchModel.selectedTags.contains(fam) ? "  ✓" : ""))
+                    } icon: {
+                        Circle().fill(swatch(for: fam))
+                    }
+                }
+            }
+        } label: {
+            HStack(spacing: 5) {
+                Image(systemName: "paintpalette")
+                    .font(.system(size: 10, weight: .medium))
+                    .foregroundColor(.white.opacity(0.6))
+                Text("color")
+                    .font(.system(size: 11, weight: .medium))
+                    .foregroundColor(.white.opacity(0.78))
                 Image(systemName: "chevron.down")
-                    .font(.system(size: 8, weight: .semibold))
+                    .font(.system(size: 7, weight: .semibold))
                     .foregroundColor(.white.opacity(0.6))
             }
-            .padding(.horizontal, 9)
+            .padding(.leading, 9)
+            .padding(.trailing, 8)
             .padding(.vertical, 4)
-            .background(RoundedRectangle(cornerRadius: 8).fill(Color.white.opacity(0.05)))
-            .overlay(RoundedRectangle(cornerRadius: 8)
-                .stroke(Color.white.opacity(0.10), lineWidth: 0.5))
+            .background(Capsule().fill(Color.white.opacity(0.06)))
+            .overlay(Capsule().stroke(Color.white.opacity(0.12), lineWidth: 0.5))
         }
+        .menuStyle(.borderlessButton)
+        .menuIndicator(.hidden)
+        .fixedSize()
+    }
+
+    private func swatch(for family: String) -> Color {
+        switch family {
+        case "black":  return .black
+        case "white":  return Color(white: 0.95)
+        case "gray":   return Color(white: 0.55)
+        case "red":    return Color(red: 0.92, green: 0.20, blue: 0.20)
+        case "orange": return Color(red: 1.00, green: 0.55, blue: 0.10)
+        case "yellow": return Color(red: 1.00, green: 0.84, blue: 0.10)
+        case "green":  return Color(red: 0.30, green: 0.78, blue: 0.35)
+        case "teal":   return Color(red: 0.10, green: 0.70, blue: 0.78)
+        case "blue":   return Color(red: 0.20, green: 0.45, blue: 0.95)
+        case "purple": return Color(red: 0.55, green: 0.32, blue: 0.85)
+        case "pink":   return Color(red: 0.95, green: 0.40, blue: 0.65)
+        case "brown":  return Color(red: 0.55, green: 0.36, blue: 0.20)
+        case "beige":  return Color(red: 0.92, green: 0.86, blue: 0.72)
+        default:        return .gray
+        }
+    }
+
+    @ViewBuilder
+    private func tagChip(_ tag: String, isSelected: Bool) -> some View {
+        Button {
+            searchModel.toggleTag(tag)
+        } label: {
+            HStack(spacing: 5) {
+                Text(tag)
+                    .font(.system(size: 11, weight: isSelected ? .semibold : .medium))
+                    .lineLimit(1)
+                    .fixedSize()
+                if isSelected {
+                    Image(systemName: "xmark")
+                        .font(.system(size: 7, weight: .bold))
+                        .opacity(0.85)
+                }
+            }
+            .foregroundColor(isSelected ? .white : .white.opacity(0.78))
+            .padding(.leading, 9)
+            .padding(.trailing, isSelected ? 6 : 9)
+            .padding(.vertical, 4)
+            .background(
+                Capsule().fill(
+                    isSelected
+                        ? rosePrimary.opacity(0.85)
+                        : Color.white.opacity(0.06)
+                )
+            )
+            .overlay(
+                Capsule().stroke(
+                    isSelected
+                        ? Color.clear
+                        : Color.white.opacity(0.12),
+                    lineWidth: 0.5
+                )
+            )
+        }
+        .buttonStyle(.plain)
     }
 
     @ViewBuilder

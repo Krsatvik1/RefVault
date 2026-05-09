@@ -125,6 +125,13 @@ struct RefVaultApp: App {
                     Task.detached { [client = coordinator.agent.client] in
                         try? await client.preload()
                     }
+                    // Backfill SHA + dHash for any records persisted
+                    // before dedup landed. Without this, dropping the
+                    // same image again wouldn't be detected as a dup
+                    // because old records have nil hashes.
+                    Task { [weak store] in
+                        await store?.backfillHashesIfNeeded()
+                    }
                     DispatchQueue.main.async {
                         NSApp.activate(ignoringOtherApps: true)
                         NSApp.windows.first?.makeKeyAndOrderFront(nil)
@@ -176,6 +183,44 @@ struct RefVaultApp: App {
                         )
                         FileHandle.standardError.write(Data(
                             "[Toast] onSaved fired kind=\(kind == .regenerate ? "regenerate" : "ingest") → presenter.show\n".utf8
+                        ))
+                        toast.show(payload)
+                    }
+                    // Duplicate skip — surface the existing record so the
+                    // user gets feedback that their drop wasn't lost.
+                    coordinator.onDuplicate = { [weak appDelegate, weak store, weak coordinator] newURL, matches, reason in
+                        guard let toast = appDelegate?.toast else { return }
+                        let hamming: Int?
+                        switch reason {
+                        case .exact: hamming = nil
+                        case .visual(let h): hamming = h
+                        }
+                        // Resolve each match's stored image URL up front so
+                        // the toast view doesn't need to reach into the
+                        // store at render time.
+                        let matchURLs: [URL] = matches.compactMap { rec in
+                            store?.storedImageURL(for: rec)
+                        }
+                        let saveAnyway: () -> Void = { [weak coordinator] in
+                            coordinator?.enqueueBypassingDedup(newURL)
+                        }
+                        let payload = ToastPayload(
+                            thumbnailURL: matchURLs.first,
+                            style: matches.first?.metadata?.style
+                                ?? matches.first?.relevance.surface ?? "",
+                            layout: matches.first?.metadata?.layout ?? "",
+                            tags: matches.first?.metadata?.tags ?? [],
+                            processingSeconds: nil,
+                            queueCount: max(0, (coordinator?.totalInProgress ?? 0)),
+                            kind: .duplicate(
+                                newImageURL: newURL,
+                                matches: matchURLs,
+                                hamming: hamming,
+                                onSaveAnyway: saveAnyway
+                            )
+                        )
+                        FileHandle.standardError.write(Data(
+                            "[Toast] onDuplicate fired reason=\(hamming.map { "visual h=\($0)" } ?? "exact") matches=\(matches.count) → presenter.show\n".utf8
                         ))
                         toast.show(payload)
                     }

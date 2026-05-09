@@ -54,21 +54,36 @@ final class ToastPanel: NSPanel {
     override var canBecomeMain: Bool { false }
 }
 
-/// Hosting view used by the toast: dismisses the toast on any mouse click.
-/// Without this, click-to-dismiss wouldn't work — SwiftUI gesture
-/// recognizers don't fire reliably on a non-key non-activating panel
-/// (that's the trade-off for true notification behavior). Click-anywhere
-/// is also nicer UX than a tiny ×.
+/// Hosting view used by the toast: routes mouse-down to one of two
+/// closures. Click inside `saveAnywayHitRect` (when set) → `onSaveAnyway`;
+/// any other click → `onMouseDown` (toast dismiss). SwiftUI gesture
+/// recognizers don't fire reliably on a non-key non-activating panel,
+/// so the button needs an explicit AppKit hit-test.
 final class ToastHostingView<Content: View>: NSHostingView<Content> {
     var onMouseDown: (() -> Void)?
+    var onSaveAnyway: (() -> Void)?
+    /// Rect (in this view's local coords, bottom-left origin) that, when
+    /// hit, fires onSaveAnyway instead of onMouseDown.
+    var saveAnywayHitRect: CGRect?
+
     override func acceptsFirstMouse(for event: NSEvent?) -> Bool { true }
     override var safeAreaInsets: NSEdgeInsets {
         NSEdgeInsets(top: 0, left: 0, bottom: 0, right: 0)
     }
     override func mouseDown(with event: NSEvent) {
-        onMouseDown?()
-        // Intentionally not forwarding to super — the entire toast is a
-        // dismiss target, no need for SwiftUI to also process the event.
+        let local = self.convert(event.locationInWindow, from: nil)
+        if let hit = saveAnywayHitRect, hit.contains(local) {
+            FileHandle.standardError.write(Data(
+                "[Toast] mouseDown HIT save-anyway at \(NSStringFromPoint(local)) (rect=\(NSStringFromRect(hit)))\n".utf8
+            ))
+            onSaveAnyway?()
+        } else {
+            FileHandle.standardError.write(Data(
+                "[Toast] mouseDown DISMISS at \(NSStringFromPoint(local)) (rect=\(saveAnywayHitRect.map { NSStringFromRect($0) } ?? "nil"))\n".utf8
+            ))
+            onMouseDown?()
+        }
+        // Intentionally not forwarding to super.
     }
 }
 
@@ -87,7 +102,7 @@ final class ToastPresenter: NSObject, ObservableObject {
     /// Inset from the bottom-right of `visibleFrame`. visibleFrame already
     /// excludes the dock, so 16pt here lands ~16pt above the dock.
     private let edgeInset: CGFloat = 16
-    private let toastSize = CGSize(width: 340, height: 96)
+    private let toastWidth: CGFloat = 340
     private let visibleSeconds: TimeInterval = 4.0
 
     override init() {
@@ -214,11 +229,12 @@ final class ToastPresenter: NSObject, ObservableObject {
 
     private func targetRect(in screen: NSScreen) -> NSRect {
         let v = screen.visibleFrame
+        let h = current?.preferredHeight ?? 96
         return NSRect(
-            x: v.maxX - toastSize.width - edgeInset,
+            x: v.maxX - toastWidth - edgeInset,
             y: v.minY + edgeInset,
-            width: toastSize.width,
-            height: toastSize.height
+            width: toastWidth,
+            height: h
         )
     }
 
@@ -226,6 +242,41 @@ final class ToastPresenter: NSObject, ObservableObject {
         let view = ToastView(payload: payload)
         let host = ToastHostingView(rootView: AnyView(view))
         host.onMouseDown = { [weak self] in self?.dismiss() }
+        // Wire the save-anyway button hit zone for duplicate toasts.
+        // CRITICAL: NSHostingView is FLIPPED by default to match SwiftUI's
+        // top-left origin, so the local point we get from convert(_:from:)
+        // in mouseDown is also top-left. Earlier I'd set this rect using
+        // bottom-left math (y=10 = "10pt up from the bottom"), which put
+        // the hit zone at the top of the view in flipped coords — every
+        // click landed in DISMISS instead. Top-left coords here:
+        //   button sits at y = 162(panel) - 10(pad) - 44(button) = 108
+        if case let .duplicate(_, _, _, onSaveAnyway) = payload.kind,
+           !payload.saveAnywaySubmitted {
+            let panelH: CGFloat = 162
+            let pad: CGFloat = 10
+            let buttonH: CGFloat = 44
+            host.saveAnywayHitRect = CGRect(
+                x: pad,
+                y: panelH - pad - buttonH,
+                width: 340 - pad * 2,
+                height: buttonH
+            )
+            host.onSaveAnyway = { [weak self] in
+                guard let self else { return }
+                onSaveAnyway()
+                // Visual ack: flip the button to a greyed "Indexing…"
+                // state, kill further clicks, then auto-dismiss after
+                // a beat so the user sees the click landed before the
+                // toast slides away.
+                self.markSubmittedAndDismissShortly()
+            }
+        } else {
+            // Either not a duplicate, or already submitted — no
+            // interactive button. Disable the hit zone so further
+            // clicks fall through to the dismiss handler.
+            host.saveAnywayHitRect = nil
+            host.onSaveAnyway = nil
+        }
         host.frame = panel.contentView?.bounds ?? .zero
         host.autoresizingMask = [.width, .height]
         panel.contentView = host
@@ -241,6 +292,24 @@ final class ToastPresenter: NSObject, ObservableObject {
         NotchSpaceManager.shared.notchSpace.windows = members
         panel.orderFrontRegardless()
         log("Space changed — re-attached panel, members=\(NotchSpaceManager.shared.notchSpace.windows.count)")
+    }
+
+    /// Mutates `current` to the submitted state, rebuilds the SwiftUI
+    /// content (button now reads "Indexing…", greyed, no hit zone), then
+    /// kicks off a short auto-dismiss so the user sees the ack before the
+    /// toast slides off-screen.
+    private func markSubmittedAndDismissShortly() {
+        guard var p = current else { return }
+        p.saveAnywaySubmitted = true
+        current = p
+        rebuildContent(for: p)
+
+        dismissTask?.cancel()
+        dismissTask = Task { [weak self] in
+            try? await Task.sleep(nanoseconds: UInt64(0.9 * 1_000_000_000))
+            guard !Task.isCancelled else { return }
+            await MainActor.run { self?.dismiss() }
+        }
     }
 
     private func scheduleDismiss() {

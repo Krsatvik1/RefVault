@@ -13,6 +13,54 @@ final class SearchModel: ObservableObject {
     @Published private(set) var parsedFilterFor: String = ""
     @Published private(set) var isParsing: Bool = false
     @Published private(set) var parseError: String? = nil
+    /// Tag chips the user has explicitly toggled on. Acts as an additional
+    /// AND-constraint over whatever the AI parsed from the free-text query.
+    @Published var selectedTags: Set<String> = []
+    /// Drives result ordering in both the main library grid and the
+    /// popover's horizontal rail.
+    @Published var sortMode: SortMode = .recent
+
+    enum SortMode: String, CaseIterable, Identifiable {
+        case recent       // newest indexed first
+        case oldest       // oldest indexed first
+        case confidence   // highest confidence first
+        case style        // alphabetical by style
+
+        var id: String { rawValue }
+        var label: String {
+            switch self {
+            case .recent: return "recent"
+            case .oldest: return "oldest"
+            case .confidence: return "confidence"
+            case .style: return "style"
+            }
+        }
+    }
+
+    func toggleTag(_ tag: String) {
+        if selectedTags.contains(tag) {
+            selectedTags.remove(tag)
+        } else {
+            selectedTags.insert(tag)
+        }
+    }
+
+    /// Apply current sort mode to a record list. Pure function so callers
+    /// can chain it after their own filtering.
+    func sorted(_ records: [ScreenshotRecord]) -> [ScreenshotRecord] {
+        switch sortMode {
+        case .recent:
+            return records.sorted { $0.indexedAt > $1.indexedAt }
+        case .oldest:
+            return records.sorted { $0.indexedAt < $1.indexedAt }
+        case .confidence:
+            return records.sorted { $0.relevance.confidence > $1.relevance.confidence }
+        case .style:
+            return records.sorted {
+                ($0.metadata?.style ?? "") < ($1.metadata?.style ?? "")
+            }
+        }
+    }
 
     private var parseTask: Task<Void, Never>?
     /// Set by the app once the agent is wired up. The model can't construct

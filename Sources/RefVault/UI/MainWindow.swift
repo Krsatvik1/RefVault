@@ -56,36 +56,9 @@ struct MainWindow: View {
                 SettingsView()
             }
         }
-        .toolbar {
-            if selection == .library {
-                ToolbarItem(placement: .primaryAction) {
-                    HStack(spacing: 6) {
-                        Image(systemName: "magnifyingglass")
-                            .foregroundColor(.secondary)
-                        TextField("Search references…", text: $searchModel.query)
-                            .textFieldStyle(.roundedBorder)
-                            .frame(minWidth: 240, idealWidth: 360)
-                            .onChange(of: searchModel.query) { newValue in
-                                searchModel.schedule(newValue)
-                            }
-                            .onSubmit {
-                                searchModel.submit()
-                            }
-                        if searchModel.isParsing {
-                            ProgressView().controlSize(.small)
-                        } else if !searchModel.query.isEmpty {
-                            Button {
-                                searchModel.clear()
-                            } label: {
-                                Image(systemName: "xmark.circle.fill")
-                                    .foregroundColor(.secondary)
-                            }
-                            .buttonStyle(.plain)
-                        }
-                    }
-                }
-            }
-        }
+        // Search lives inside LibraryView's header now — we get full
+        // styling control there instead of fighting with the toolbar's
+        // imposed text-field look + system-blue focus ring.
         .task { await checkOllama() }
     }
 

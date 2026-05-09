@@ -63,12 +63,37 @@ struct Typography: Codable, Equatable {
 
     init(from decoder: Decoder) throws {
         let c = try decoder.container(keyedBy: CodingKeys.self)
-        self.headings = (try? c.decode([String].self, forKey: .headings)) ?? []
-        self.bodies = (try? c.decode([String].self, forKey: .bodies)) ?? []
-        self.others = (try? c.decode([String].self, forKey: .others)) ?? []
+        let h = (try? c.decode([String].self, forKey: .headings)) ?? []
+        let b = (try? c.decode([String].self, forKey: .bodies)) ?? []
+        let o = (try? c.decode([String].self, forKey: .others)) ?? []
+        // Gemma frequently returns the same generic ("sans-serif") repeated
+        // 10+ times in a single axis. Dedupe at the type level so every
+        // decode path (per-field granular calls, combined metadata calls,
+        // disk reload) gets the cleanup automatically.
+        self.headings = Self.sanitize(h)
+        self.bodies = Self.sanitize(b)
+        self.others = Self.sanitize(o)
     }
 
     enum CodingKeys: String, CodingKey { case headings, bodies, others }
+
+    /// Trim, drop empties, and dedupe preserving first-seen order with a
+    /// case-insensitive key (so "Sans-Serif" and "sans-serif" collapse).
+    /// Cross-axis dedup is intentionally NOT done — a font legitimately
+    /// used for both headings and bodies should appear in both lists.
+    private static func sanitize(_ raw: [String]) -> [String] {
+        var seen = Set<String>()
+        var out: [String] = []
+        for s in raw {
+            let trimmed = s.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !trimmed.isEmpty else { continue }
+            let key = trimmed.lowercased()
+            if seen.insert(key).inserted {
+                out.append(trimmed)
+            }
+        }
+        return out
+    }
 
     var isEmpty: Bool {
         headings.isEmpty && bodies.isEmpty && others.isEmpty
@@ -170,6 +195,18 @@ struct ScreenshotRecord: Equatable, Identifiable {
     /// timing field existed) decode with `nil` and are filled on next regen.
     var processingSeconds: Double?
 
+    /// SHA-256 of the source file bytes. Used as the cheap exact-dup
+    /// check when the file watcher (or a manual import) tries to enqueue
+    /// the same image at a different path. Optional for back-compat with
+    /// records saved before this field existed — those decode `nil` and
+    /// get backfilled on next regenerate.
+    var fileHash: String?
+
+    /// 64-bit perceptual difference hash of the screenshot (top region
+    /// masked off to ignore browser chrome). Used for visual-dup checks
+    /// via `PerceptualHash.hammingDistance`. Optional for back-compat.
+    var perceptualHash: UInt64?
+
     /// Computed from pixel dimensions; not asked of the model.
     var orientation: String {
         guard imageWidth > 0, imageHeight > 0 else { return "unknown" }
@@ -191,7 +228,9 @@ struct ScreenshotRecord: Equatable, Identifiable {
         metadata: DesignMetadata?,
         palette: ColorPalette?,
         visibleURL: VisibleURL?,
-        processingSeconds: Double? = nil
+        processingSeconds: Double? = nil,
+        fileHash: String? = nil,
+        perceptualHash: UInt64? = nil
     ) {
         self.id = id
         self.sourceFilePath = sourceFilePath
@@ -205,6 +244,8 @@ struct ScreenshotRecord: Equatable, Identifiable {
         self.palette = palette
         self.visibleURL = visibleURL
         self.processingSeconds = processingSeconds
+        self.fileHash = fileHash
+        self.perceptualHash = perceptualHash
     }
 }
 
@@ -214,6 +255,7 @@ extension ScreenshotRecord: Codable {
         case imageWidth, imageHeight
         case relevance, metadata, palette, visibleURL
         case processingSeconds
+        case fileHash, perceptualHash
     }
 
     init(from decoder: Decoder) throws {
@@ -232,6 +274,10 @@ extension ScreenshotRecord: Codable {
         // processingSeconds is optional and was added later — older library
         // entries simply decode it as nil.
         self.processingSeconds = try? c.decode(Double.self, forKey: .processingSeconds)
+        // Hashes were added later for dedup; pre-existing records decode
+        // nil and get backfilled on next regenerate.
+        self.fileHash = try? c.decode(String.self, forKey: .fileHash)
+        self.perceptualHash = try? c.decode(UInt64.self, forKey: .perceptualHash)
     }
 }
 

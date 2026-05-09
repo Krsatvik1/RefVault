@@ -20,7 +20,6 @@ struct LibraryView: View {
     var body: some View {
         VStack(spacing: 0) {
             header
-            ActivityBar()
             Divider()
             content
         }
@@ -68,7 +67,7 @@ struct LibraryView: View {
     }
 
     private var header: some View {
-        VStack(alignment: .leading, spacing: 10) {
+        VStack(alignment: .leading, spacing: 12) {
             HStack {
                 Text("Library")
                     .font(.title2.weight(.semibold))
@@ -88,6 +87,48 @@ struct LibraryView: View {
                 }
                 .help("Send every existing screenshot in the watched folders through Gemma. Useful on first launch.")
             }
+
+            // Custom search field — toolbar-embedded TextField with
+            // .roundedBorder gave us the system blue focus ring and ugly
+            // chrome. Plain text field inside our own capsule lets us
+            // own the full look.
+            CustomSearchField()
+
+            // Selected chips with × to remove. Sits between the search
+            // field and the available-tags row so the selected set
+            // visually "lives with" the text input — clicking a chip in
+            // the available row promotes it up into this row.
+            if !searchModel.selectedTags.isEmpty {
+                SelectedTagsRow(
+                    selected: searchModel.selectedTags,
+                    onRemove: { searchModel.toggleTag($0) }
+                )
+            }
+
+            // Available tags from library vocabulary, with selected ones
+            // filtered out (they live in the selected row above).
+            // The color picker sits inline with the tags row so the user
+            // can add a color filter alongside tag filters; chosen colors
+            // also land in selectedTags and use the same chip UI above.
+            HStack(spacing: 8) {
+                ColorPickerMenu(
+                    selected: searchModel.selectedTags,
+                    onPick: { searchModel.toggleTag($0) }
+                )
+                if !store.vocabulary.tags.isEmpty {
+                    let available = store.vocabulary.tags.filter {
+                        !searchModel.selectedTags.contains($0)
+                    }
+                    if !available.isEmpty {
+                        TagFilterRow(
+                            tags: available,
+                            selected: [],
+                            onToggle: { searchModel.toggleTag($0) }
+                        )
+                    }
+                }
+            }
+
             if !query.trimmingCharacters(in: .whitespaces).isEmpty {
                 if let filter = parsedFilter, parsedFilterFor == query, !filter.isEmpty {
                     FilterChips(filter: filter, isParsing: false)
@@ -125,6 +166,28 @@ struct LibraryView: View {
         } else {
             ScrollView {
                 LazyVGrid(columns: columns, spacing: 16) {
+                    // In-flight + queued ingest placeholders, rendered
+                    // before saved records so the user sees their drop
+                    // immediately even though the agent hasn't finished.
+                    // We only show the running one when no regen is
+                    // active; otherwise the inFlight URL belongs to a
+                    // regen and the LibraryCard for that record is
+                    // already showing the +Ns pill.
+                    if let url = coordinator.inFlight,
+                       coordinator.regenerateStartedAt.isEmpty,
+                       let started = coordinator.inFlightStartedAt {
+                        IngestingCard(url: url, startedAt: started)
+                    }
+                    ForEach(coordinator.pending, id: \.self) { url in
+                        IngestingCard(url: url, startedAt: nil)
+                            .contextMenu {
+                                Button(role: .destructive) {
+                                    coordinator.cancel(url)
+                                } label: {
+                                    Label("Remove from queue", systemImage: "xmark")
+                                }
+                            }
+                    }
                     ForEach(results) { rec in
                         LibraryCard(record: rec)
                             .onTapGesture { selectedRecord = rec }
@@ -172,10 +235,232 @@ extension LibraryView {
     /// structured filter; otherwise fall back to substring search so the grid
     /// reacts immediately to typing while Gemma is in flight.
     fileprivate var currentResults: [ScreenshotRecord] {
+        let base: [ScreenshotRecord]
         if let filter = parsedFilter, parsedFilterFor == query, !filter.isEmpty {
-            return store.search(filter: filter)
+            base = store.search(filter: filter)
+        } else {
+            base = store.search(query)
         }
-        return store.search(query)
+        let selected = searchModel.selectedTags
+        let filtered: [ScreenshotRecord]
+        if selected.isEmpty {
+            filtered = base
+        } else {
+            // Selected tokens AND-match either against the record's tags
+            // OR against any color family in its palette. This lets a
+            // color family ("brown") and a tag ("editorial") coexist as
+            // selected chips and the record satisfies both constraints.
+            filtered = base.filter { record in
+                let recordTags = Set(record.metadata?.tags ?? [])
+                let recordColors: Set<String> = Set(
+                    (record.palette?.all ?? []).flatMap { ColorNamer.families(for: $0) }
+                )
+                return selected.allSatisfy { sel in
+                    recordTags.contains(sel) || recordColors.contains(sel)
+                }
+            }
+        }
+        return searchModel.sorted(filtered)
+    }
+}
+
+// MARK: Custom search field
+
+private struct CustomSearchField: View {
+    @EnvironmentObject var searchModel: SearchModel
+    @FocusState private var isFocused: Bool
+
+    var body: some View {
+        HStack(spacing: 8) {
+            Image(systemName: "magnifyingglass")
+                .font(.system(size: 13, weight: .medium))
+                .foregroundColor(Color.secondary.opacity(isFocused ? 0.9 : 0.55))
+            TextField("Search references…", text: $searchModel.query)
+                .textFieldStyle(.plain)
+                .font(.system(size: 13))
+                .focused($isFocused)
+                .onChange(of: searchModel.query) { newValue in
+                    searchModel.schedule(newValue)
+                }
+                .onSubmit { searchModel.submit() }
+            if searchModel.isParsing {
+                ProgressView().controlSize(.small)
+            } else if !searchModel.query.isEmpty {
+                Button {
+                    searchModel.clear()
+                } label: {
+                    Image(systemName: "xmark.circle.fill")
+                        .font(.system(size: 12))
+                        .foregroundColor(.secondary)
+                }
+                .buttonStyle(.plain)
+            }
+        }
+        .padding(.horizontal, 12)
+        .padding(.vertical, 8)
+        .background(
+            RoundedRectangle(cornerRadius: 9, style: .continuous)
+                .fill(Color.secondary.opacity(isFocused ? 0.10 : 0.06))
+        )
+        .overlay(
+            // Subtle inner focus ring instead of macOS's harsh blue accent.
+            // Tightens up only when focused; otherwise a thin neutral edge.
+            RoundedRectangle(cornerRadius: 9, style: .continuous)
+                .strokeBorder(
+                    isFocused
+                        ? Color.secondary.opacity(0.45)
+                        : Color.secondary.opacity(0.20),
+                    lineWidth: isFocused ? 1.5 : 1
+                )
+        )
+        .animation(.easeOut(duration: 0.12), value: isFocused)
+    }
+}
+
+// MARK: Color picker menu
+
+/// Dropdown of broad color families (yellow, green, brown, …). Picking a
+/// color toggles it into searchModel.selectedTags using the family name —
+/// the result filter then matches the family against any record's
+/// palette via ColorNamer.families(for:).
+private struct ColorPickerMenu: View {
+    let selected: Set<String>
+    let onPick: (String) -> Void
+
+    var body: some View {
+        Menu {
+            ForEach(ColorNamer.allFamilies, id: \.self) { fam in
+                Button {
+                    onPick(fam)
+                } label: {
+                    Label {
+                        Text(fam.capitalized + (selected.contains(fam) ? "  ✓" : ""))
+                    } icon: {
+                        Circle().fill(swatch(for: fam))
+                    }
+                }
+            }
+        } label: {
+            HStack(spacing: 6) {
+                Image(systemName: "paintpalette")
+                    .font(.system(size: 11, weight: .medium))
+                    .foregroundColor(.secondary)
+                Text("Color")
+                    .font(.caption.weight(.medium))
+                    .foregroundColor(.primary)
+                Image(systemName: "chevron.down")
+                    .font(.system(size: 8, weight: .semibold))
+                    .foregroundColor(.secondary)
+            }
+            .padding(.horizontal, 10)
+            .padding(.vertical, 5)
+            .background(Capsule().fill(Color.secondary.opacity(0.12)))
+            .overlay(Capsule().stroke(Color.secondary.opacity(0.20), lineWidth: 1))
+        }
+        .menuStyle(.borderlessButton)
+        .menuIndicator(.hidden)
+        .fixedSize()
+    }
+
+    /// Approximate swatch color for each family — just for the dropdown
+    /// preview, not used for filtering.
+    private func swatch(for family: String) -> Color {
+        switch family {
+        case "black":  return .black
+        case "white":  return Color(white: 0.95)
+        case "gray":   return Color(white: 0.55)
+        case "red":    return Color(red: 0.92, green: 0.20, blue: 0.20)
+        case "orange": return Color(red: 1.00, green: 0.55, blue: 0.10)
+        case "yellow": return Color(red: 1.00, green: 0.84, blue: 0.10)
+        case "green":  return Color(red: 0.30, green: 0.78, blue: 0.35)
+        case "teal":   return Color(red: 0.10, green: 0.70, blue: 0.78)
+        case "blue":   return Color(red: 0.20, green: 0.45, blue: 0.95)
+        case "purple": return Color(red: 0.55, green: 0.32, blue: 0.85)
+        case "pink":   return Color(red: 0.95, green: 0.40, blue: 0.65)
+        case "brown":  return Color(red: 0.55, green: 0.36, blue: 0.20)
+        case "beige":  return Color(red: 0.92, green: 0.86, blue: 0.72)
+        default:        return .gray
+        }
+    }
+}
+
+// MARK: Selected tags row (chips with × to remove)
+
+private struct SelectedTagsRow: View {
+    let selected: Set<String>
+    let onRemove: (String) -> Void
+
+    var body: some View {
+        ScrollView(.horizontal, showsIndicators: false) {
+            HStack(spacing: 6) {
+                ForEach(Array(selected).sorted(), id: \.self) { tag in
+                    Button {
+                        onRemove(tag)
+                    } label: {
+                        HStack(spacing: 5) {
+                            Text(tag)
+                                .font(.caption.weight(.semibold))
+                                .lineLimit(1)
+                                .fixedSize()
+                            Image(systemName: "xmark")
+                                .font(.system(size: 8, weight: .bold))
+                                .opacity(0.85)
+                        }
+                        .foregroundColor(.white)
+                        .padding(.leading, 10)
+                        .padding(.trailing, 7)
+                        .padding(.vertical, 5)
+                        .background(Capsule().fill(Color.accentColor.opacity(0.95)))
+                    }
+                    .buttonStyle(.plain)
+                }
+            }
+            .padding(.vertical, 1)
+        }
+    }
+}
+
+// MARK: Tag filter row
+
+private struct TagFilterRow: View {
+    let tags: [String]
+    let selected: Set<String>
+    let onToggle: (String) -> Void
+
+    var body: some View {
+        ScrollView(.horizontal, showsIndicators: false) {
+            HStack(spacing: 6) {
+                ForEach(tags, id: \.self) { tag in
+                    let isOn = selected.contains(tag)
+                    Button {
+                        onToggle(tag)
+                    } label: {
+                        Text(tag)
+                            .font(.caption.weight(isOn ? .semibold : .medium))
+                            .lineLimit(1)
+                            .fixedSize()
+                            .padding(.horizontal, 10)
+                            .padding(.vertical, 5)
+                            .background(
+                                Capsule().fill(isOn
+                                    ? Color.accentColor.opacity(0.95)
+                                    : Color.secondary.opacity(0.12))
+                            )
+                            .foregroundColor(isOn ? .white : .primary)
+                            .overlay(
+                                Capsule().stroke(
+                                    isOn
+                                        ? Color.clear
+                                        : Color.secondary.opacity(0.20),
+                                    lineWidth: 1
+                                )
+                            )
+                    }
+                    .buttonStyle(.plain)
+                }
+            }
+            .padding(.vertical, 1)
+        }
     }
 }
 
@@ -240,21 +525,26 @@ struct LibraryCard: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
-            ZStack {
-                Color.secondary.opacity(0.1)
-                if let url = store.storedImageURL(for: record),
-                   let image = NSImage(contentsOf: url) {
-                    Image(nsImage: image)
-                        .resizable()
-                        .aspectRatio(contentMode: .fill)
-                } else {
-                    Image(systemName: "photo")
-                        .font(.system(size: 28))
-                        .foregroundColor(.secondary)
+            // Image area is locked to a 16:10 aspect (the standard Mac
+            // screenshot ratio for both MBP retina and 4K external
+            // displays). Long captures (full-page scrolls, sidebar +
+            // canvas split, etc.) crop to a screen-shaped preview from
+            // the top instead of being squashed into a fixed strip.
+            Color.secondary.opacity(0.1)
+                .aspectRatio(16.0 / 10.0, contentMode: .fit)
+                .overlay {
+                    if let url = store.storedImageURL(for: record),
+                       let image = NSImage(contentsOf: url) {
+                        Image(nsImage: image)
+                            .resizable()
+                            .aspectRatio(contentMode: .fill)
+                    } else {
+                        Image(systemName: "photo")
+                            .font(.system(size: 28))
+                            .foregroundColor(.secondary)
+                    }
                 }
-            }
-            .frame(height: 140)
-            .clipped()
+                .clipped()
 
             VStack(alignment: .leading, spacing: 8) {
                 HStack(spacing: 4) {
@@ -302,6 +592,12 @@ struct LibraryCard: View {
             }
             .padding(12)
         }
+        // maxWidth pins the OUTER VStack to whatever width the LazyVGrid
+        // column hands us. Without this the image area's intrinsic width
+        // can leak through the VStack and stretch the card past the
+        // grid's column-max constraint, which is what was making the
+        // cards look ~500pt wide instead of capping at 320.
+        .frame(maxWidth: .infinity)
         .background(Color.secondary.opacity(0.04))
         .cornerRadius(10)
         .overlay(
@@ -312,16 +608,156 @@ struct LibraryCard: View {
                 )
         )
         .overlay(alignment: .topTrailing) {
-            if isRegenerating {
-                Text("queued")
-                    .font(.system(size: 9, weight: .semibold))
+            regenStatusOverlay
+                .padding(8)
+        }
+    }
+
+    /// Three states:
+    ///  - In-flight (regenerateStartedAt[id] != nil): live elapsed pill.
+    ///  - Queued (in regeneratingIds but no startedAt yet): "queued" pill
+    ///    with a × that pulls it out of pendingRegens.
+    ///  - Idle: nothing.
+    @ViewBuilder
+    private var regenStatusOverlay: some View {
+        if let started = coordinator.regenerateStartedAt[record.id] {
+            // Running now — show a live counter so the user knows it's
+            // making progress. TimelineView re-renders this label only,
+            // not the rest of the card.
+            TimelineView(.periodic(from: .now, by: 1.0)) { context in
+                let secs = max(0, Int(context.date.timeIntervalSince(started)))
+                Text("+\(secs)s")
+                    .font(.system(size: 9, weight: .semibold).monospacedDigit())
                     .tracking(0.5)
                     .foregroundColor(.white)
                     .padding(.horizontal, 8)
                     .padding(.vertical, 3)
                     .background(Capsule().fill(rosePrimary))
-                    .padding(8)
             }
+        } else if isRegenerating {
+            // Queued, not yet picked. Show the label + a × that cancels
+            // the queued job (no Ollama call has started, safe to drop).
+            HStack(spacing: 4) {
+                Text("queued")
+                    .font(.system(size: 9, weight: .semibold))
+                    .tracking(0.5)
+                    .foregroundColor(.white)
+                Button {
+                    coordinator.cancelRegenerate(record)
+                } label: {
+                    Image(systemName: "xmark")
+                        .font(.system(size: 8, weight: .bold))
+                        .foregroundColor(.white)
+                }
+                .buttonStyle(.plain)
+            }
+            .padding(.leading, 8)
+            .padding(.trailing, 6)
+            .padding(.vertical, 3)
+            .background(Capsule().fill(rosePrimary))
+        }
+    }
+}
+
+/// Placeholder card for a screenshot that's currently in flight or queued
+/// for ingestion. Mirrors LibraryCard's outer dimensions so the grid stays
+/// aligned, but the body slot stays empty (no metadata exists yet).
+/// Top-right pill mirrors LibraryCard's regen overlay: live elapsed timer
+/// when running, "queued ×" when waiting (× is a context-menu action since
+/// the queued case is the only cancellable one).
+struct IngestingCard: View {
+    let url: URL
+    /// Wall-clock start of the in-flight run. Nil = still queued.
+    let startedAt: Date?
+    @EnvironmentObject var coordinator: IngestionCoordinator
+
+    private var rosePrimary: Color {
+        Color(red: 1.0, green: 0.216, blue: 0.373)
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 0) {
+            // 16:10 standard Mac screenshot aspect — matches LibraryCard
+            // so placeholder slots line up with populated cards in the
+            // grid. Long captures crop from the top.
+            Color.secondary.opacity(0.1)
+                .aspectRatio(16.0 / 10.0, contentMode: .fit)
+                .overlay {
+                    if let image = NSImage(contentsOf: url) {
+                        Image(nsImage: image)
+                            .resizable()
+                            .aspectRatio(contentMode: .fill)
+                            .opacity(0.55)
+                    } else {
+                        Image(systemName: "photo")
+                            .font(.system(size: 28))
+                            .foregroundColor(.secondary)
+                    }
+                }
+                .clipped()
+
+            // Body matches LibraryCard's natural footprint without the
+            // fixed-height clamp — the LazyVGrid row already equalizes
+            // sibling heights, so we don't need to force 140pt here. That
+            // was making the placeholder taller than populated cards.
+            VStack(alignment: .leading, spacing: 8) {
+                Text(url.lastPathComponent)
+                    .font(.caption.monospaced())
+                    .foregroundColor(.secondary)
+                    .lineLimit(1)
+                    .truncationMode(.middle)
+                Text(startedAt == nil ? "waiting in queue" : "indexing…")
+                    .font(.caption2)
+                    .foregroundColor(.secondary)
+            }
+            .padding(12)
+            .frame(maxWidth: .infinity, alignment: .leading)
+        }
+        .background(Color.secondary.opacity(0.04))
+        .cornerRadius(10)
+        .overlay(
+            RoundedRectangle(cornerRadius: 10)
+                .stroke(rosePrimary.opacity(startedAt == nil ? 0.4 : 0.9),
+                        lineWidth: startedAt == nil ? 1 : 1.5)
+        )
+        .overlay(alignment: .topTrailing) {
+            statusPill
+                .padding(8)
+        }
+    }
+
+    @ViewBuilder
+    private var statusPill: some View {
+        if let started = startedAt {
+            TimelineView(.periodic(from: .now, by: 1.0)) { context in
+                let secs = max(0, Int(context.date.timeIntervalSince(started)))
+                Text("+\(secs)s")
+                    .font(.system(size: 9, weight: .semibold).monospacedDigit())
+                    .tracking(0.5)
+                    .foregroundColor(.white)
+                    .padding(.horizontal, 8)
+                    .padding(.vertical, 3)
+                    .background(Capsule().fill(rosePrimary))
+            }
+        } else {
+            HStack(spacing: 4) {
+                Text("queued")
+                    .font(.system(size: 9, weight: .semibold))
+                    .tracking(0.5)
+                    .foregroundColor(.white)
+                Button {
+                    coordinator.cancel(url)
+                } label: {
+                    Image(systemName: "xmark")
+                        .font(.system(size: 8, weight: .bold))
+                        .foregroundColor(.white)
+                }
+                .buttonStyle(.plain)
+            }
+            .padding(.leading, 8)
+            .padding(.trailing, 6)
+            .padding(.vertical, 3)
+            .background(Capsule().fill(rosePrimary))
         }
     }
 }
@@ -392,84 +828,6 @@ struct EmptyState: View {
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
         .padding(32)
-    }
-}
-
-/// Compact panel showing what's processing now and what's queued. Hidden
-/// when nothing is in flight and the queue is empty.
-struct ActivityBar: View {
-    @EnvironmentObject var coordinator: IngestionCoordinator
-
-    var body: some View {
-        if coordinator.inFlight == nil && coordinator.pending.isEmpty {
-            EmptyView()
-        } else {
-            VStack(alignment: .leading, spacing: 8) {
-                HStack(spacing: 10) {
-                    if let url = coordinator.inFlight {
-                        ProgressView()
-                            .controlSize(.small)
-                        VStack(alignment: .leading, spacing: 1) {
-                            Text("Indexing")
-                                .font(.caption2.weight(.semibold))
-                                .foregroundColor(.secondary)
-                            Text(url.lastPathComponent)
-                                .font(.caption.monospaced())
-                                .lineLimit(1)
-                                .truncationMode(.middle)
-                        }
-                    }
-                    Spacer()
-                    if !coordinator.pending.isEmpty {
-                        Text("\(coordinator.pending.count) queued")
-                            .font(.caption.weight(.medium))
-                            .foregroundColor(.secondary)
-                        Button("Clear queue") { coordinator.clearPending() }
-                            .buttonStyle(.borderless)
-                            .controlSize(.small)
-                    }
-                }
-
-                if !coordinator.pending.isEmpty {
-                    ScrollView(.horizontal, showsIndicators: false) {
-                        HStack(spacing: 6) {
-                            ForEach(coordinator.pending, id: \.self) { url in
-                                QueueChip(url: url) {
-                                    coordinator.cancel(url)
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-            .padding(.horizontal, 16)
-            .padding(.vertical, 10)
-            .background(Color.secondary.opacity(0.06))
-        }
-    }
-}
-
-private struct QueueChip: View {
-    let url: URL
-    let onCancel: () -> Void
-
-    var body: some View {
-        HStack(spacing: 4) {
-            Text(url.lastPathComponent)
-                .font(.caption2.monospaced())
-                .lineLimit(1)
-                .truncationMode(.middle)
-            Button(action: onCancel) {
-                Image(systemName: "xmark.circle.fill")
-                    .font(.caption2)
-                    .foregroundColor(.secondary)
-            }
-            .buttonStyle(.plain)
-        }
-        .padding(.horizontal, 8)
-        .padding(.vertical, 4)
-        .background(Color.secondary.opacity(0.15))
-        .cornerRadius(6)
     }
 }
 

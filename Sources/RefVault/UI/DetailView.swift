@@ -220,16 +220,77 @@ struct DetailView: View {
 private struct FlowingTags: View {
     let tags: [String]
     var body: some View {
-        let columns = [GridItem(.adaptive(minimum: 60, maximum: 200), spacing: 4)]
-        LazyVGrid(columns: columns, alignment: .leading, spacing: 4) {
+        // Real flow layout — every chip sizes to its content and wraps to
+        // the next row only when it would overflow. The previous LazyVGrid
+        // assigned each chip a fixed column slot, which forced long words
+        // like "typography" to hyphenate or truncate.
+        TagFlowLayout(spacing: 6, rowSpacing: 6) {
             ForEach(tags, id: \.self) { tag in
                 Text(tag)
                     .font(.caption2)
+                    .lineLimit(1)
+                    .fixedSize()
                     .padding(.horizontal, 6)
                     .padding(.vertical, 3)
                     .background(Color.secondary.opacity(0.12))
                     .cornerRadius(4)
             }
+        }
+    }
+}
+
+/// Left-to-right flow layout that wraps to a new row when the next subview
+/// would overflow the proposed width. Each subview receives a `.unspecified`
+/// proposal so it sizes naturally — chips render at their intrinsic width
+/// instead of being squished into a column.
+private struct TagFlowLayout: Layout {
+    var spacing: CGFloat = 6
+    var rowSpacing: CGFloat = 6
+
+    func sizeThatFits(
+        proposal: ProposedViewSize,
+        subviews: Subviews,
+        cache: inout ()
+    ) -> CGSize {
+        let maxWidth = proposal.width ?? .greatestFiniteMagnitude
+        var x: CGFloat = 0
+        var y: CGFloat = 0
+        var rowHeight: CGFloat = 0
+        var maxRowWidth: CGFloat = 0
+        for sv in subviews {
+            let size = sv.sizeThatFits(.unspecified)
+            if x > 0, x + size.width > maxWidth {
+                maxRowWidth = max(maxRowWidth, x - spacing)
+                x = 0
+                y += rowHeight + rowSpacing
+                rowHeight = 0
+            }
+            x += size.width + spacing
+            rowHeight = max(rowHeight, size.height)
+        }
+        maxRowWidth = max(maxRowWidth, x - spacing)
+        return CGSize(width: maxRowWidth, height: y + rowHeight)
+    }
+
+    func placeSubviews(
+        in bounds: CGRect,
+        proposal: ProposedViewSize,
+        subviews: Subviews,
+        cache: inout ()
+    ) {
+        var x: CGFloat = bounds.minX
+        var y: CGFloat = bounds.minY
+        var rowHeight: CGFloat = 0
+        for sv in subviews {
+            let size = sv.sizeThatFits(.unspecified)
+            if x > bounds.minX, x + size.width > bounds.maxX {
+                x = bounds.minX
+                y += rowHeight + rowSpacing
+                rowHeight = 0
+            }
+            sv.place(at: CGPoint(x: x, y: y), proposal: ProposedViewSize(size))
+            x += size.width + spacing
+            rowHeight = max(rowHeight, size.height)
         }
     }
 }

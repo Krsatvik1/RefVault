@@ -46,6 +46,96 @@ final class LibraryStore: ObservableObject {
         records.contains(where: { $0.sourceFilePath == sourcePath })
     }
 
+    /// Cheap exact-match dedup: returns the record whose `fileHash` equals
+    /// the given SHA-256, if any. Catches "same file at a different path."
+    func findExactDuplicate(sha: String) -> ScreenshotRecord? {
+        records.first(where: { $0.fileHash == sha })
+    }
+
+    /// Visual dedup: returns the closest record whose `perceptualHash` is
+    /// within `threshold` Hamming bits of `phash`. Returns nil if nothing
+    /// is close enough or no records have a perceptual hash yet.
+    /// Threshold default 6 — see PerceptualHash.dHash documentation.
+    func findVisualDuplicate(
+        phash: UInt64,
+        threshold: Int = 6
+    ) -> (record: ScreenshotRecord, hamming: Int)? {
+        findVisualDuplicates(phash: phash, threshold: threshold).first
+    }
+
+    /// All records within Hamming `threshold`, sorted nearest-first.
+    /// Used by the duplicate toast which shows the new image highlighted
+    /// alongside every existing reference it matched.
+    func findVisualDuplicates(
+        phash: UInt64,
+        threshold: Int = 6
+    ) -> [(record: ScreenshotRecord, hamming: Int)] {
+        var out: [(ScreenshotRecord, Int)] = []
+        for r in records {
+            guard let existing = r.perceptualHash else { continue }
+            let d = PerceptualHash.hammingDistance(existing, phash)
+            if d <= threshold {
+                out.append((r, d))
+            }
+        }
+        return out
+            .sorted { $0.1 < $1.1 }
+            .map { (record: $0.0, hamming: $0.1) }
+    }
+
+    /// Compute SHA + dHash for any record that's missing them. Fixes the
+    /// "uploaded the same image but dedup didn't catch it" problem caused
+    /// by records persisted before the dedup feature shipped — they
+    /// decoded with nil hashes, so the duplicate check found nothing to
+    /// match against. Runs on a background task at startup; persists once
+    /// at the end so we're not writing the JSON N times.
+    func backfillHashesIfNeeded() async {
+        let need = records.filter { $0.fileHash == nil || $0.perceptualHash == nil }
+        guard !need.isEmpty else {
+            FileHandle.standardError.write(Data(
+                "[Library] backfill: all \(records.count) records already have hashes\n".utf8
+            ))
+            return
+        }
+        FileHandle.standardError.write(Data(
+            "[Library] backfill: computing hashes for \(need.count) of \(records.count) records\n".utf8
+        ))
+
+        // Snapshot the (id, url) pairs and compute hashes off the main
+        // actor so we don't block UI for ~30ms × N records.
+        let work: [(UUID, URL)] = need.compactMap { rec in
+            guard let url = storedImageURL(for: rec) else { return nil }
+            return (rec.id, url)
+        }
+        let results: [(UUID, String?, UInt64?)] = await Task.detached(priority: .utility) {
+            work.map { id, url in
+                let sha = PerceptualHash.sha256(of: url)
+                let phash = PerceptualHash.dHash(of: url)
+                return (id, sha, phash)
+            }
+        }.value
+
+        // Apply results back on the main actor.
+        var changed = 0
+        for (id, sha, phash) in results {
+            guard let idx = records.firstIndex(where: { $0.id == id }) else { continue }
+            if records[idx].fileHash == nil, let sha {
+                records[idx].fileHash = sha
+                changed += 1
+            }
+            if records[idx].perceptualHash == nil, let phash {
+                records[idx].perceptualHash = phash
+                changed += 1
+            }
+        }
+        if changed > 0 {
+            persist()
+        }
+        FileHandle.standardError.write(Data(
+            "[Library] backfill: done, updated \(changed) field(s)\n".utf8
+        ))
+    }
+
     func storedImageURL(for record: ScreenshotRecord) -> URL? {
         guard let name = record.storedFileName else { return nil }
         return imagesDir.appendingPathComponent(name)
@@ -66,7 +156,9 @@ final class LibraryStore: ObservableObject {
     func saveRecord(
         from result: AgentResult,
         sourceURL: URL,
-        processingSeconds: Double? = nil
+        processingSeconds: Double? = nil,
+        fileHash: String? = nil,
+        perceptualHash: UInt64? = nil
     ) -> ScreenshotRecord? {
         let dimensions = imageDimensions(for: sourceURL)
         let storedFileName: String
@@ -90,7 +182,9 @@ final class LibraryStore: ObservableObject {
             metadata: result.metadata,
             palette: result.palette,
             visibleURL: result.visibleURL,
-            processingSeconds: processingSeconds
+            processingSeconds: processingSeconds,
+            fileHash: fileHash,
+            perceptualHash: perceptualHash
         )
         records.insert(record, at: 0)
         persist()
@@ -104,7 +198,9 @@ final class LibraryStore: ObservableObject {
     func update(
         record: ScreenshotRecord,
         with result: AgentResult,
-        processingSeconds: Double? = nil
+        processingSeconds: Double? = nil,
+        fileHash: String? = nil,
+        perceptualHash: UInt64? = nil
     ) -> ScreenshotRecord? {
         guard let idx = records.firstIndex(where: { $0.id == record.id }) else {
             return nil
@@ -117,6 +213,15 @@ final class LibraryStore: ObservableObject {
         updated.indexedAt = Date()
         if let s = processingSeconds {
             updated.processingSeconds = s
+        }
+        // Backfill hashes only when caller supplied them (regenerate path
+        // computes them; old records had nil before dedup landed and get
+        // a value the next time they're regenerated).
+        if let fh = fileHash {
+            updated.fileHash = fh
+        }
+        if let ph = perceptualHash {
+            updated.perceptualHash = ph
         }
         records[idx] = updated
         persist()
