@@ -611,6 +611,18 @@ struct LibraryCard: View {
             regenStatusOverlay
                 .padding(8)
         }
+        // Drag the card to drop the underlying screenshot file into any
+        // app (Figma, Slack, Mail, Finder, browser tab). NSItemProvider
+        // registered with the file URL gives receivers the real file —
+        // they decide whether to copy, upload, or embed.
+        .onDrag {
+            if let url = store.storedImageURL(for: record),
+               let provider = NSItemProvider(contentsOf: url) {
+                provider.suggestedName = url.lastPathComponent
+                return provider
+            }
+            return NSItemProvider()
+        }
     }
 
     /// Three states:

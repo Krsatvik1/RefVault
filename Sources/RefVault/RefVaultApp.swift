@@ -40,6 +40,16 @@ final class RefVaultAppDelegate: NSObject, NSApplicationDelegate {
         statusItem = item
 
         let presenter = IslandPresenter()
+        // Pin the popover to the screen the status item button actually
+        // lives on. Without this it falls through to NSScreen.main, which
+        // points at the screen with the key window — wrong target when
+        // the user clicked the menu bar on a secondary display or while
+        // a fullscreen app is active (no key window in the normal sense).
+        presenter.screenResolver = { [weak item] in
+            if let s = item?.button?.window?.screen { return s }
+            let mouse = NSEvent.mouseLocation
+            return NSScreen.screens.first(where: { $0.frame.contains(mouse) })
+        }
         presenter.setContent(content)
         island = presenter
 
@@ -50,6 +60,9 @@ final class RefVaultAppDelegate: NSObject, NSApplicationDelegate {
     }
 
     @objc private func toggleIsland() {
+        FileHandle.standardError.write(Data(
+            "[Island] toggleIsland clicked — island=\(island != nil ? "ok" : "nil") isVisible=\(island?.isVisible ?? false) statusItem.button.window=\(statusItem?.button?.window != nil ? "ok" : "nil") buttonWindowScreen=\(statusItem?.button?.window?.screen.map { NSStringFromRect($0.frame) } ?? "nil") activeApp=\(NSWorkspace.shared.frontmostApplication?.localizedName ?? "nil")\n".utf8
+        ))
         guard let island else { return }
         if island.isVisible {
             island.hide()

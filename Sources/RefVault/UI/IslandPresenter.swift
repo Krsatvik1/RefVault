@@ -7,14 +7,25 @@ final class IslandPanel: NSPanel {
     init() {
         super.init(
             contentRect: NSRect(x: 0, y: 0, width: 360, height: 240),
-            // No `.nonactivatingPanel`. We intentionally let the app
-            // activate when the panel is clicked — that's how
-            // boring.notch / SkyLightWindow handle it, and it's required
-            // for SwiftUI Button gestures to complete (a non-key,
-            // non-activating panel doesn't promote subviews into the
-            // tap-tracking state machine, so mouseUp never reaches the
-            // gesture and the action callback never fires).
-            styleMask: [.borderless, .fullSizeContentView],
+            // `.nonactivatingPanel` is what makes this panel actually
+            // appear when the user is in another app's fullscreen Space
+            // (e.g. fullscreen Ghostty). Without it, AppKit treats the
+            // panel as a normal interactive window — and since clicking
+            // the menu bar item from a fullscreen Space doesn't activate
+            // RefVault into that Space, NSPanel's hidesOnDeactivate
+            // immediately strips the panel from our CGS notchSpace and
+            // hides it. The toast had the exact same bug.
+            //
+            // Trade-off the old comment warned about: with
+            // `.nonactivatingPanel`, SwiftUI Button gestures can be
+            // unreliable because the panel's subviews aren't promoted
+            // into the tap-tracking state machine until the panel is
+            // key. We compensate below by keeping canBecomeKey=true and
+            // calling makeKey() in show() — that lets SwiftUI gestures
+            // fire from our regular Space, and from a fullscreen Space
+            // the first user click on the panel promotes it (via
+            // acceptsFirstMouse on the hosting view).
+            styleMask: [.borderless, .nonactivatingPanel, .fullSizeContentView],
             backing: .buffered,
             defer: false
         )
@@ -26,6 +37,12 @@ final class IslandPanel: NSPanel {
         isMovable = false
         isReleasedWhenClosed = false
         isFloatingPanel = true
+        // Don't disappear when RefVault deactivates — the whole point of
+        // the popover is that it shows over whatever app is in front,
+        // including fullscreen apps where RefVault never gets activated.
+        // NSPanel defaults this to true; that's what was hiding the panel
+        // in another app's fullscreen Space.
+        hidesOnDeactivate = false
         // NSWindow.level can't punch through the menu bar — that's a hard
         // cap by the WindowServer. The actual mechanism that puts this
         // panel above the menu bar is `NotchSpaceManager.shared.notchSpace`,
@@ -87,6 +104,60 @@ final class IslandPresenter: NSObject, ObservableObject {
     /// scroll track (14) + gaps + padding.
     private let fullHeight: CGFloat = 320
 
+    /// Resolver for the screen the popover should anchor to. Set by the
+    /// app delegate to the status item's window screen — `NSScreen.main`
+    /// is the screen with the key window, NOT the screen the user clicked
+    /// the menu bar on, so it returns the wrong display (or nil) when a
+    /// fullscreen app is active or the menu bar is on a secondary monitor.
+    var screenResolver: (() -> NSScreen?)?
+
+    /// Screen the panel is currently anchored to. Captured at show() time
+    /// so hide()'s collapse animation lands on the same display even if
+    /// focus moved between show and hide.
+    private var anchoredScreen: NSScreen?
+
+    private var spaceChangeObserver: NSObjectProtocol?
+
+    override init() {
+        super.init()
+        // Without this, switching Mission Control Spaces (especially in/out
+        // of a fullscreen app on a secondary display) leaves the popover
+        // stranded behind the new active Space's window stack. Toast had
+        // the same bug — fix is the same: re-pin to our CGS space and
+        // re-promote when the active Space changes.
+        spaceChangeObserver = NSWorkspace.shared.notificationCenter.addObserver(
+            forName: NSWorkspace.activeSpaceDidChangeNotification,
+            object: nil,
+            queue: .main
+        ) { [weak self] _ in
+            Task { @MainActor [weak self] in
+                self?.reattachToCurrentSpace()
+            }
+        }
+    }
+
+    deinit {
+        if let obs = spaceChangeObserver {
+            NSWorkspace.shared.notificationCenter.removeObserver(obs)
+        }
+    }
+
+    private func resolveScreen() -> NSScreen? {
+        let resolverScreen = screenResolver?()
+        let mouse = NSEvent.mouseLocation
+        let mouseScreen = NSScreen.screens.first(where: { $0.frame.contains(mouse) })
+        let mainScreen = NSScreen.main
+        let allScreens = NSScreen.screens.enumerated().map { i, s in
+            "\(i):\(NSStringFromRect(s.frame))"
+        }.joined(separator: " | ")
+        FileHandle.standardError.write(Data(
+            "[Island] resolveScreen — resolver=\(resolverScreen.map { NSStringFromRect($0.frame) } ?? "nil") mouse=\(NSStringFromPoint(mouse)) mouseScreen=\(mouseScreen.map { NSStringFromRect($0.frame) } ?? "nil") main=\(mainScreen.map { NSStringFromRect($0.frame) } ?? "nil") all=[\(allScreens)]\n".utf8
+        ))
+        if let s = resolverScreen { return s }
+        if let s = mouseScreen { return s }
+        return mainScreen ?? NSScreen.screens.first
+    }
+
     func setContent<V: View>(_ view: V) {
         let host = FirstMouseHostingView(rootView: AnyView(view))
         host.frame = panel.contentView?.bounds ?? .zero
@@ -99,7 +170,19 @@ final class IslandPresenter: NSObject, ObservableObject {
     }
 
     func show() {
-        guard let screen = NSScreen.main else { return }
+        FileHandle.standardError.write(Data(
+            "[Island] show() called — isVisible=\(isVisible) panel.isVisible=\(panel.isVisible)\n".utf8
+        ))
+        guard let screen = resolveScreen() else {
+            FileHandle.standardError.write(Data(
+                "[Island] show() — no screen resolvable, aborting\n".utf8
+            ))
+            return
+        }
+        anchoredScreen = screen
+        FileHandle.standardError.write(Data(
+            "[Island] show() anchoring to screen frame=\(NSStringFromRect(screen.frame)) visibleFrame=\(NSStringFromRect(screen.visibleFrame))\n".utf8
+        ))
 
         let frame = screen.frame
         let centerX = frame.midX
@@ -119,18 +202,52 @@ final class IslandPresenter: NSObject, ObservableObject {
 
         panel.setFrame(startRect, display: true)
         panel.alphaValue = 0
-        panel.orderFront(nil)
 
-        // Move the panel into the custom CGS space. This is the trick that
-        // actually places the window above the menu bar.
+        // Join the custom CGS space FIRST. orderFrontRegardless after
+        // joining keeps the panel in our notchSpace at Int32.max-2 (above
+        // every Space, including other apps' fullscreen Spaces).
+        //
+        // Earlier we used makeKeyAndOrderFront here, which re-orders the
+        // panel into the *regular per-Space* window stack. When the user
+        // clicks our menu bar item from inside another app's fullscreen
+        // Space (e.g. fullscreen Ghostty), that "regular Space" for
+        // RefVault is its own Desktop 1 — so the panel gets placed there
+        // and is invisible to the user in Ghostty's Space. Symptom in the
+        // log: panel.isKey=false in the failing case (key promotion is
+        // denied across fullscreen-app Space boundaries) but panel.isVisible
+        // is true on a Space the user can't see.
+        //
+        // orderFrontRegardless avoids both problems: doesn't trigger app
+        // activation (so user stays in their fullscreen Space) and doesn't
+        // re-attach to the regular Space stack (so notchSpace membership
+        // sticks). Trade-off: panel doesn't become key automatically. The
+        // first click on the panel (via acceptsFirstMouse on the hosting
+        // view) brings RefVault forward and promotes the panel to key,
+        // which is when SwiftUI Button gestures + the search field start
+        // accepting input. This matches how Spotlight / Raycast feel from
+        // a fullscreen Space.
         var members = NotchSpaceManager.shared.notchSpace.windows
         members.insert(panel)
         NotchSpaceManager.shared.notchSpace.windows = members
+        FileHandle.standardError.write(Data(
+            "[Island] show() — joined notchSpace, members=\(NotchSpaceManager.shared.notchSpace.windows.count)\n".utf8
+        ))
 
-        // Promote to key AFTER joining the space — this is the order
-        // boring.notch / SkyLightWindow use. Without it, SwiftUI Button
-        // gestures can't complete because the panel never becomes key.
-        panel.makeKeyAndOrderFront(nil)
+        panel.orderFrontRegardless()
+        FileHandle.standardError.write(Data(
+            "[Island] show() — after orderFrontRegardless, panel.frame=\(NSStringFromRect(panel.frame)) panel.screen=\(panel.screen.map { NSStringFromRect($0.frame) } ?? "nil") panel.isVisible=\(panel.isVisible) panel.isKey=\(panel.isKeyWindow)\n".utf8
+        ))
+
+        // Try to promote to key WITHOUT re-ordering. makeKey doesn't move
+        // the window in the screen list — only flips key status. If we're
+        // in our own Space this succeeds and SwiftUI gestures fire
+        // immediately; if we're in another app's fullscreen Space the OS
+        // denies the promotion silently and the first user click on the
+        // panel handles it instead.
+        panel.makeKey()
+        FileHandle.standardError.write(Data(
+            "[Island] show() — after makeKey, panel.isKey=\(panel.isKeyWindow)\n".utf8
+        ))
 
         isVisible = true
 
@@ -145,7 +262,10 @@ final class IslandPresenter: NSObject, ObservableObject {
     }
 
     func hide() {
-        guard let screen = NSScreen.main else {
+        // Use the screen we anchored to in show(); falling back to a
+        // freshly-resolved one keeps the collapse animation correct even
+        // if the resolver's source (status item button) has gone away.
+        guard let screen = anchoredScreen ?? resolveScreen() else {
             panel.orderOut(nil)
             isVisible = false
             return
@@ -173,7 +293,24 @@ final class IslandPresenter: NSObject, ObservableObject {
                 NotchSpaceManager.shared.notchSpace.windows = members
                 self.panel.orderOut(nil)
                 self.isVisible = false
+                self.anchoredScreen = nil
             }
         })
+    }
+
+    /// Re-pin to our CGS space + re-promote when the user switches Mission
+    /// Control Spaces. Without this, a popover left open while the user
+    /// swipes to another desktop or enters a fullscreen app falls behind
+    /// the new Space's window stack and is invisible until next click.
+    private func reattachToCurrentSpace() {
+        guard isVisible else { return }
+        var members = NotchSpaceManager.shared.notchSpace.windows
+        members.insert(panel)
+        NotchSpaceManager.shared.notchSpace.windows = members
+        panel.orderFrontRegardless()
+        // Re-key so SwiftUI gestures (search field, sort menu, tag chips)
+        // still fire on the new Space. orderFrontRegardless alone is
+        // enough for the toast (no gestures), but the popover needs key.
+        panel.makeKey()
     }
 }

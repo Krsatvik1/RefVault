@@ -734,6 +734,16 @@ struct MenuBarContent: View {
                 .stroke(Color.white.opacity(0.08), lineWidth: 0.5))
             .onTapGesture { openMainWindow() }
             .help(cardLabel(for: rec))
+            // Same drag affordance as the main library — drop the file
+            // into any other app. Single tap still opens the main window.
+            .onDrag {
+                if let url = store.storedImageURL(for: rec),
+                   let provider = NSItemProvider(contentsOf: url) {
+                    provider.suggestedName = url.lastPathComponent
+                    return provider
+                }
+                return NSItemProvider()
+            }
 
             HStack(spacing: 6) {
                 Text(cardTitle(for: rec))
