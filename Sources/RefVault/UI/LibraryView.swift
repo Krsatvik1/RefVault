@@ -263,11 +263,21 @@ func chipHaystack(for record: ScreenshotRecord) -> Set<String> {
         set.insert(m.style.lowercased())
         set.insert(m.mood.lowercased())
         set.insert(m.layout.lowercased())
-        // Slot-qualified typography tokens so chips like "heading: serif"
-        // only match records that have serif specifically in headings.
-        set.formUnion(m.typography.headings.map { "heading: \($0.lowercased())" })
-        set.formUnion(m.typography.bodies.map { "body: \($0.lowercased())" })
-        set.formUnion(m.typography.others.map { "other: \($0.lowercased())" })
+        // Slot-qualified typography tokens. Each font name expands to
+        // its specific token AND its class fallback ("mono", "serif",
+        // "sans-serif"), because Gemma usually stores the family name
+        // (e.g. "JetBrains Mono"), not the abstract class — without the
+        // fallback the chip "heading: mono" wouldn't match a record
+        // whose haystack only has "heading: jetbrains mono".
+        for f in m.typography.headings {
+            set.formUnion(typographyTokens(slot: "heading", font: f))
+        }
+        for f in m.typography.bodies {
+            set.formUnion(typographyTokens(slot: "body", font: f))
+        }
+        for f in m.typography.others {
+            set.formUnion(typographyTokens(slot: "other", font: f))
+        }
     }
     if let palette = record.palette {
         let families = palette.all.flatMap { ColorNamer.families(for: $0) }
@@ -277,6 +287,29 @@ func chipHaystack(for record: ScreenshotRecord) -> Set<String> {
     set.insert(record.relevance.device.lowercased())
     set.insert(record.orientation.lowercased())
     return set
+}
+
+/// Slot-qualified tokens for a single font name. Always emits the
+/// specific token (e.g. "heading: jetbrains mono") and any class
+/// fallbacks the font name implies — so picking "mono" / "serif" /
+/// "sans-serif" from the dropdown catches every member of that family
+/// even when the record stored a specific name.
+///
+/// "sans" check runs before "serif" because every "sans-serif" string
+/// contains "serif" too — without the order guard a sans-serif font
+/// would also fire the serif fallback, which is wrong.
+private func typographyTokens(slot: String, font: String) -> Set<String> {
+    let lower = font.lowercased()
+    var out: Set<String> = ["\(slot): \(lower)"]
+    if lower.contains("mono") {
+        out.insert("\(slot): mono")
+    }
+    if lower.contains("sans") {
+        out.insert("\(slot): sans-serif")
+    } else if lower.contains("serif") {
+        out.insert("\(slot): serif")
+    }
+    return out
 }
 
 extension LibraryView {
