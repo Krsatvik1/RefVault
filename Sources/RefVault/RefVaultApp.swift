@@ -10,6 +10,7 @@ import AppKit
 final class RefVaultAppDelegate: NSObject, NSApplicationDelegate {
     var statusItem: NSStatusItem?
     var island: IslandPresenter?
+    var toast: ToastPresenter?
     private var globalDismissMonitor: Any?
 
     func applicationDidFinishLaunching(_ notification: Notification) {
@@ -41,6 +42,11 @@ final class RefVaultAppDelegate: NSObject, NSApplicationDelegate {
         let presenter = IslandPresenter()
         presenter.setContent(content)
         island = presenter
+
+        if toast == nil { toast = ToastPresenter() }
+        FileHandle.standardError.write(Data(
+            "[Toast] install() ran — island=\(island != nil ? "ok" : "nil") toast=\(toast != nil ? "ok" : "nil")\n".utf8
+        ))
     }
 
     @objc private func toggleIsland() {
@@ -123,6 +129,10 @@ struct RefVaultApp: App {
                         NSApp.activate(ignoringOtherApps: true)
                         NSApp.windows.first?.makeKeyAndOrderFront(nil)
                     }
+                    // Install must run BEFORE wiring onSaved so the
+                    // diagnostic log accurately reports the toast presenter
+                    // state and the closure has something to talk to from
+                    // the very first save.
                     if appDelegate.island == nil {
                         // Capture the concrete delegate. Going through
                         // `NSApp.delegate as? RefVaultAppDelegate` was
@@ -140,6 +150,34 @@ struct RefVaultApp: App {
                             .environmentObject(watcher)
                             .environmentObject(searchModel)
                         appDelegate.install(island: content)
+                    }
+                    // Wire AFTER install so the toast presenter exists at
+                    // both wire-time and fire-time. Closure captures
+                    // appDelegate / store / coordinator weakly so it stays
+                    // safe across window lifecycle.
+                    FileHandle.standardError.write(Data(
+                        "[Toast] wiring coordinator.onSaved — toast presenter=\(appDelegate.toast != nil ? "exists" : "NIL")\n".utf8
+                    ))
+                    coordinator.onSaved = { [weak appDelegate, weak store, weak coordinator] saved, elapsed, kind in
+                        guard let toast = appDelegate?.toast else {
+                            FileHandle.standardError.write(Data(
+                                "[Toast] onSaved fired but appDelegate.toast is nil — install never ran?\n".utf8
+                            ))
+                            return
+                        }
+                        let payload = ToastPayload(
+                            thumbnailURL: store?.storedImageURL(for: saved),
+                            style: saved.metadata?.style ?? saved.relevance.surface,
+                            layout: saved.metadata?.layout ?? "",
+                            tags: saved.metadata?.tags ?? [],
+                            processingSeconds: elapsed,
+                            queueCount: max(0, (coordinator?.totalInProgress ?? 1) - 1),
+                            kind: kind == .regenerate ? .regenerate : .ingest
+                        )
+                        FileHandle.standardError.write(Data(
+                            "[Toast] onSaved fired kind=\(kind == .regenerate ? "regenerate" : "ingest") → presenter.show\n".utf8
+                        ))
+                        toast.show(payload)
                     }
                 }
         }

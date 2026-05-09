@@ -473,20 +473,49 @@ struct GemmaAgent {
     private func runURL(
         client: OllamaClient,
         imageBase64: String,
-        onEvent: @Sendable (Event) -> Void
+        onEvent: @escaping @Sendable (Event) -> Void
     ) async -> VisibleURL? {
-        do {
-            let prompt = try PromptStore.load("url")
-            let (decoded, _) = try await client.generateJSON(
-                prompt: prompt,
-                imageBase64: imageBase64,
-                as: VisibleURL.self
-            )
-            onEvent(.visibleURL(decoded))
-            return decoded
-        } catch {
-            onEvent(.failed(error, stage: "url"))
-            return nil
+        // Cap the URL call at 90s. URL extraction is a nice-to-have — never
+        // worth blocking the entire save behind a model that's swap-thrashing
+        // (we saw a 182s hang on a cross-model contention case before
+        // routing URL back to the active client). 90s gives a slow first
+        // call plenty of room while still bounding worst-case lock-up.
+        await withTaskGroup(of: VisibleURL?.self) { group in
+            group.addTask {
+                do {
+                    let prompt = try PromptStore.load("url")
+                    let (decoded, _) = try await client.generateJSON(
+                        prompt: prompt,
+                        imageBase64: imageBase64,
+                        as: VisibleURL.self
+                    )
+                    onEvent(.visibleURL(decoded))
+                    return decoded
+                } catch {
+                    onEvent(.failed(error, stage: "url"))
+                    return nil
+                }
+            }
+            group.addTask {
+                // Critical: only log "timed out" if the sleep actually
+                // ran to completion. When the URL task wins the race we
+                // call group.cancelAll() — that cancels this sleep, which
+                // throws CancellationError. Without the explicit isCancelled
+                // check, the closure would continue past `try?` and emit a
+                // misleading "timed out" log even on the happy path.
+                do {
+                    try await Task.sleep(nanoseconds: 90 * 1_000_000_000)
+                } catch {
+                    return nil
+                }
+                FileHandle.standardError.write(Data(
+                    "[Agent] url extraction timed out after 90s — continuing without URL\n".utf8
+                ))
+                return nil
+            }
+            let first = await group.next() ?? nil
+            group.cancelAll()
+            return first
         }
     }
 }

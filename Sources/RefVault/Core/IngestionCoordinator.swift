@@ -66,6 +66,16 @@ final class IngestionCoordinator: ObservableObject {
     let store: LibraryStore
     var agent: GemmaAgent
 
+    /// Fires once for every record that completes a pipeline run, whether
+    /// it's a fresh ingest (`kind = .ingest`) or a regenerate
+    /// (`kind = .regenerate`). The Double is wall-clock seconds the agent
+    /// took. Wired in `RefVaultApp.onAppear` to drive the bottom-right
+    /// notification — toast renders both kinds, with the kind controlling
+    /// the dot color and verb ("saved" vs "refreshed").
+    var onSaved: ((ScreenshotRecord, Double, ToastKind) -> Void)?
+
+    enum ToastKind { case ingest, regenerate }
+
     private var processing = false
     /// Pending regenerate jobs, processed through the same pump as `pending`
     /// so we don't fan out parallel Ollama calls. Each entry is the record
@@ -99,9 +109,22 @@ final class IngestionCoordinator: ObservableObject {
     /// Add a URL to the ingestion queue. Skipped if already in the library
     /// or already queued or currently in-flight.
     func enqueue(_ url: URL) {
-        guard !store.contains(sourcePath: url.path) else { return }
-        guard !pending.contains(url), inFlight != url else { return }
+        guard !store.contains(sourcePath: url.path) else {
+            FileHandle.standardError.write(Data(
+                "[Queue] enqueue \(url.lastPathComponent) → SKIP (already in library)\n".utf8
+            ))
+            return
+        }
+        guard !pending.contains(url), inFlight != url else {
+            FileHandle.standardError.write(Data(
+                "[Queue] enqueue \(url.lastPathComponent) → SKIP (already queued / in-flight)\n".utf8
+            ))
+            return
+        }
         pending.append(url)
+        FileHandle.standardError.write(Data(
+            "[Queue] enqueue \(url.lastPathComponent) → ingest (depth ingest=\(pending.count) regen=\(pendingRegens.count) inFlight=\(inFlight != nil))\n".utf8
+        ))
         Task { await pump() }
     }
 
@@ -121,17 +144,43 @@ final class IngestionCoordinator: ObservableObject {
     /// existing record's metadata via `store.update(record:with:)`.
     /// Idempotent — duplicate calls while one is already pending no-op.
     func regenerate(_ record: ScreenshotRecord) {
-        guard let url = store.storedImageURL(for: record) else { return }
-        guard !regeneratingIds.contains(record.id) else { return }
+        guard let url = store.storedImageURL(for: record) else {
+            FileHandle.standardError.write(Data(
+                "[Queue] regenerate \(record.id.uuidString.prefix(8)) → SKIP (no stored image)\n".utf8
+            ))
+            return
+        }
+        guard !regeneratingIds.contains(record.id) else {
+            FileHandle.standardError.write(Data(
+                "[Queue] regenerate \(record.id.uuidString.prefix(8)) → SKIP (already pending)\n".utf8
+            ))
+            return
+        }
         regeneratingIds.insert(record.id)
         pendingRegens.append((record, url))
+        FileHandle.standardError.write(Data(
+            "[Queue] regenerate \(record.id.uuidString.prefix(8)) → enqueued (depth ingest=\(pending.count) regen=\(pendingRegens.count) inFlight=\(inFlight != nil))\n".utf8
+        ))
         Task { await pump() }
     }
 
     private func pump() async {
-        guard !processing else { return }
+        guard !processing else {
+            FileHandle.standardError.write(Data(
+                "[Queue] pump skipped — already processing\n".utf8
+            ))
+            return
+        }
         processing = true
-        defer { processing = false }
+        FileHandle.standardError.write(Data(
+            "[Queue] pump START (ingest=\(pending.count) regen=\(pendingRegens.count))\n".utf8
+        ))
+        defer {
+            processing = false
+            FileHandle.standardError.write(Data(
+                "[Queue] pump DONE — both queues drained\n".utf8
+            ))
+        }
         while !pending.isEmpty || !pendingRegens.isEmpty {
             // Drain new ingests first — they're typically user-triggered or
             // newly-arrived screenshots and the user is more likely waiting
@@ -140,6 +189,9 @@ final class IngestionCoordinator: ObservableObject {
                 let next = pending.removeFirst()
                 inFlight = next
                 inFlightStartedAt = Date()
+                FileHandle.standardError.write(Data(
+                    "[Queue] pick INGEST \(next.lastPathComponent) (remaining ingest=\(pending.count) regen=\(pendingRegens.count))\n".utf8
+                ))
                 await process(next)
                 inFlightStartedAt = nil
                 inFlight = nil
@@ -148,6 +200,9 @@ final class IngestionCoordinator: ObservableObject {
                 inFlight = job.url
                 inFlightStartedAt = Date()
                 regenerateStartedAt[job.record.id] = Date()
+                FileHandle.standardError.write(Data(
+                    "[Queue] pick REGEN \(job.record.id.uuidString.prefix(8)) (remaining ingest=\(pending.count) regen=\(pendingRegens.count))\n".utf8
+                ))
                 await processRegen(record: job.record, url: job.url)
                 regenerateStartedAt.removeValue(forKey: job.record.id)
                 inFlightStartedAt = nil
@@ -167,13 +222,28 @@ final class IngestionCoordinator: ObservableObject {
                 urlFirstFlow: urlFirstFlow
             )
             let elapsed = Date().timeIntervalSince(started)
-            _ = store.update(record: record, with: result, processingSeconds: elapsed)
+            FileHandle.standardError.write(Data(
+                "[Toast] agent returned (regen) isDesign=\(result.relevance.isDesign) conf=\(String(format: "%.2f", result.relevance.confidence)) elapsed=\(String(format: "%.1fs", elapsed))\n".utf8
+            ))
+            let updated = store.update(record: record, with: result, processingSeconds: elapsed)
             appendLog(LogLine(
                 url: url,
                 outcome: "regenerated · \(result.relevance.surface) · conf \(formatted(result.relevance.confidence)) · \(String(format: "%.1fs", elapsed))",
                 saved: true
             ))
+            // Regenerate always toasts — it's an explicit user-triggered
+            // action, so they should see confirmation regardless of the
+            // confidence threshold (which only gates fresh ingest).
+            let toastRecord = updated ?? record
+            let hasCb = onSaved != nil
+            FileHandle.standardError.write(Data(
+                "[Toast] regen done kind=regenerate id=\(toastRecord.id.uuidString.prefix(8)) elapsed=\(String(format: "%.1fs", elapsed)) onSaved=\(hasCb ? "wired" : "NIL")\n".utf8
+            ))
+            onSaved?(toastRecord, elapsed, .regenerate)
         } catch {
+            FileHandle.standardError.write(Data(
+                "[Toast] regen threw — \(error.localizedDescription)\n".utf8
+            ))
             appendLog(LogLine(
                 url: url,
                 outcome: "regenerate error: \(error.localizedDescription)",
@@ -192,7 +262,14 @@ final class IngestionCoordinator: ObservableObject {
                 urlFirstFlow: urlFirstFlow
             )
             let elapsed = Date().timeIntervalSince(started)
-            if store.shouldKeep(result) {
+            FileHandle.standardError.write(Data(
+                "[Toast] agent returned isDesign=\(result.relevance.isDesign) conf=\(String(format: "%.2f", result.relevance.confidence)) surface=\(result.relevance.surface) elapsed=\(String(format: "%.1fs", elapsed))\n".utf8
+            ))
+            let keep = store.shouldKeep(result)
+            FileHandle.standardError.write(Data(
+                "[Toast] shouldKeep=\(keep) (threshold=\(String(format: "%.2f", store.confidenceThreshold)))\n".utf8
+            ))
+            if keep {
                 if let saved = store.saveRecord(
                     from: result,
                     sourceURL: url,
@@ -203,7 +280,15 @@ final class IngestionCoordinator: ObservableObject {
                         outcome: "saved · \(saved.relevance.surface) · \(saved.relevance.device) · conf \(formatted(saved.relevance.confidence))",
                         saved: true
                     ))
+                    let hasCb = onSaved != nil
+                    FileHandle.standardError.write(Data(
+                        "[Toast] saveRecord ok kind=ingest id=\(saved.id.uuidString.prefix(8)) elapsed=\(String(format: "%.1fs", elapsed)) onSaved=\(hasCb ? "wired" : "NIL")\n".utf8
+                    ))
+                    onSaved?(saved, elapsed, .ingest)
                 } else {
+                    FileHandle.standardError.write(Data(
+                        "[Toast] saveRecord returned nil — file copy failed\n".utf8
+                    ))
                     appendLog(LogLine(
                         url: url,
                         outcome: "save failed (file copy error)",
@@ -214,9 +299,15 @@ final class IngestionCoordinator: ObservableObject {
                 let why = result.relevance.isDesign
                     ? "below threshold (\(formatted(result.relevance.confidence)))"
                     : "not design — \(result.relevance.reason)"
+                FileHandle.standardError.write(Data(
+                    "[Toast] skipped → \(why) (no toast)\n".utf8
+                ))
                 appendLog(LogLine(url: url, outcome: "skipped: \(why)", saved: false))
             }
         } catch {
+            FileHandle.standardError.write(Data(
+                "[Toast] agent threw — \(error.localizedDescription)\n".utf8
+            ))
             appendLog(LogLine(
                 url: url,
                 outcome: "error: \(error.localizedDescription)",

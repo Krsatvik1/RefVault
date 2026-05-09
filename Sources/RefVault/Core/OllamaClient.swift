@@ -32,11 +32,14 @@ struct OllamaClient {
         "gemma4:26b"
     ]
 
-    /// Mid-weight model used for the URL extraction call only — OCR of the
-    /// address bar. e2b returned false negatives (saying no URL exists when
-    /// one was clearly visible), so we step up to e4b which is still ~2-3×
-    /// faster than the 26b primary but reliable on chrome OCR.
-    static let defaultURLModel = "gemma4:e4b"
+    /// Model used for the URL extraction call. Defaults to nil so the URL
+    /// call rides the same active client as everything else (no model
+    /// switch, no second model load). Routing URL to a smaller model like
+    /// e4b is a tempting micro-optimization but it forces Ollama to load a
+    /// second model on top of the pinned 26b — on a 24GB machine this
+    /// blows the memory budget and the URL call swap-thrashes for minutes
+    /// before timing out, blocking the whole save. Keep them on one model.
+    static let defaultURLModel: String? = nil
 
     /// Returns a copy of this client configured to talk to a different model.
     func withModel(_ name: String) -> OllamaClient {
