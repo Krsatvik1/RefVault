@@ -1,0 +1,11 @@
+Look at this design reference. Pick the SINGLE label that best describes
+its layout / page type.
+
+Return ONLY this JSON:
+{ "layout": "..." }
+
+Allowed values:
+hero, pricing, dashboard, landing, portfolio, blog, product-detail,
+navigation, form, modal, mobile-screen, poster, illustration, other
+
+Use "other" if none fit. Strict JSON, no prose.

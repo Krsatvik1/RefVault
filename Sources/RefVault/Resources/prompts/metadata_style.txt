@@ -1,0 +1,11 @@
+Look at this design reference. Pick the SINGLE best label that describes its
+visual style.
+
+Return ONLY this JSON:
+{ "style": "..." }
+
+Allowed values:
+minimal, maximalist, brutalist, neo-brutalist, editorial, corporate, playful,
+retro, futuristic, glassmorphic, skeuomorphic, other
+
+Use "other" only if none of the named styles fit. Return strict JSON, no prose.

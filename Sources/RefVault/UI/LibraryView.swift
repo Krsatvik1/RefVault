@@ -5,22 +5,66 @@ struct LibraryView: View {
     @EnvironmentObject var store: LibraryStore
     @EnvironmentObject var coordinator: IngestionCoordinator
     @EnvironmentObject var watcher: ScreenshotWatcher
+    @EnvironmentObject var searchModel: SearchModel
 
-    @State private var query: String = ""
     @State private var selectedRecord: ScreenshotRecord?
 
     private let columns = [GridItem(.adaptive(minimum: 220, maximum: 320), spacing: 16)]
 
+    private var query: String { searchModel.query }
+    private var parsedFilter: SearchFilter? { searchModel.parsedFilter }
+    private var parsedFilterFor: String { searchModel.parsedFilterFor }
+    private var isParsing: Bool { searchModel.isParsing }
+    private var parseError: String? { searchModel.parseError }
+
     var body: some View {
         VStack(spacing: 0) {
             header
+            ActivityBar()
             Divider()
             content
         }
         .sheet(item: $selectedRecord) { rec in
+            let dims = sheetDimensions(for: rec)
             DetailView(record: rec)
-                .frame(minWidth: 720, minHeight: 520)
+                .frame(width: dims.width, height: dims.height)
         }
+    }
+
+    /// Pick a sheet size that lets the image's full aspect ratio fit the
+    /// pane with minimal letterboxing. Targets ~92% of the available screen
+    /// in whichever direction the image needs most.
+    private func sheetDimensions(for rec: ScreenshotRecord) -> (width: CGFloat, height: CGFloat) {
+        let metadataColumnWidth: CGFloat = 360
+        let chromeVPadding: CGFloat = 24
+
+        let screenSize = NSScreen.main?.visibleFrame.size ??
+            CGSize(width: 1440, height: 900)
+        let maxW = screenSize.width * 0.92
+        let maxH = screenSize.height * 0.92
+
+        let aspect: Double
+        if rec.imageWidth > 0, rec.imageHeight > 0 {
+            aspect = Double(rec.imageWidth) / Double(rec.imageHeight)
+        } else {
+            aspect = 16.0 / 10.0
+        }
+
+        // Start by maximizing the image's height up to the screen budget,
+        // then shrink horizontally if that overflows screen width.
+        var imageH = maxH - chromeVPadding
+        var imageW = imageH * CGFloat(aspect)
+        let availableImageWidth = maxW - metadataColumnWidth
+        if imageW > availableImageWidth {
+            imageW = availableImageWidth
+            imageH = imageW / CGFloat(aspect)
+        }
+        let totalW = imageW + metadataColumnWidth
+        let totalH = imageH + chromeVPadding
+        return (
+            width:  max(900, totalW),
+            height: max(600, totalH)
+        )
     }
 
     private var header: some View {
@@ -44,23 +88,28 @@ struct LibraryView: View {
                 }
                 .help("Send every existing screenshot in the watched folders through Gemma. Useful on first launch.")
             }
-            HStack(spacing: 8) {
-                Image(systemName: "magnifyingglass")
-                    .foregroundColor(.secondary)
-                TextField("Search tags, style, surface, device…", text: $query)
-                    .textFieldStyle(.plain)
+            if !query.trimmingCharacters(in: .whitespaces).isEmpty {
+                if let filter = parsedFilter, parsedFilterFor == query, !filter.isEmpty {
+                    FilterChips(filter: filter, isParsing: false)
+                } else {
+                    FilterChips(
+                        filter: SearchFilter(freeText: query),
+                        isParsing: isParsing
+                    )
+                }
+                if let err = parseError {
+                    Text("Couldn't parse query — falling back to keyword match. (\(err))")
+                        .font(.caption2)
+                        .foregroundColor(.secondary)
+                }
             }
-            .padding(.vertical, 6)
-            .padding(.horizontal, 10)
-            .background(Color.secondary.opacity(0.08))
-            .cornerRadius(8)
         }
         .padding(16)
     }
 
     @ViewBuilder
     private var content: some View {
-        let results = store.search(query)
+        let results = currentResults
         if store.records.isEmpty {
             EmptyState(
                 title: "No references yet",
@@ -80,6 +129,15 @@ struct LibraryView: View {
                         LibraryCard(record: rec)
                             .onTapGesture { selectedRecord = rec }
                             .contextMenu {
+                                Button {
+                                    coordinator.regenerate(rec)
+                                } label: {
+                                    Label("Regenerate", systemImage: "arrow.clockwise")
+                                }
+                                .disabled(coordinator.regeneratingIds.contains(rec.id))
+
+                                Divider()
+
                                 Button("Open original in Finder") {
                                     NSWorkspace.shared.activateFileViewerSelecting(
                                         [URL(fileURLWithPath: rec.sourceFilePath)]
@@ -109,9 +167,76 @@ struct LibraryView: View {
     }
 }
 
+extension LibraryView {
+    /// Records to render. If Gemma already parsed the current query, use the
+    /// structured filter; otherwise fall back to substring search so the grid
+    /// reacts immediately to typing while Gemma is in flight.
+    fileprivate var currentResults: [ScreenshotRecord] {
+        if let filter = parsedFilter, parsedFilterFor == query, !filter.isEmpty {
+            return store.search(filter: filter)
+        }
+        return store.search(query)
+    }
+}
+
+private struct FilterChips: View {
+    let filter: SearchFilter
+    let isParsing: Bool
+
+    var body: some View {
+        let columns = [GridItem(.adaptive(minimum: 80, maximum: 240), spacing: 4)]
+        LazyVGrid(columns: columns, alignment: .leading, spacing: 4) {
+            if isParsing {
+                HStack(spacing: 4) {
+                    ProgressView().controlSize(.small)
+                    Text("parsing…")
+                        .font(.caption2.monospaced())
+                }
+                .padding(.horizontal, 6)
+                .padding(.vertical, 3)
+                .background(Color.secondary.opacity(0.15))
+                .cornerRadius(4)
+            }
+            ForEach(chips, id: \.self) { chip in
+                Text(chip)
+                    .font(.caption2.monospaced())
+                    .padding(.horizontal, 6)
+                    .padding(.vertical, 3)
+                    .background(Color.accentColor.opacity(0.15))
+                    .foregroundColor(.accentColor)
+                    .cornerRadius(4)
+            }
+        }
+    }
+
+    private var chips: [String] {
+        var out: [String] = []
+        if let v = filter.surfaces, !v.isEmpty { out.append("surface: \(v.joined(separator: "/"))") }
+        if let v = filter.devices, !v.isEmpty { out.append("device: \(v.joined(separator: "/"))") }
+        if let v = filter.orientations, !v.isEmpty { out.append("orient: \(v.joined(separator: "/"))") }
+        if let v = filter.styles, !v.isEmpty { out.append("style: \(v.joined(separator: "/"))") }
+        if let v = filter.moods, !v.isEmpty { out.append("mood: \(v.joined(separator: "/"))") }
+        if let v = filter.tagsAll, !v.isEmpty { out.append("must: \(v.joined(separator: " + "))") }
+        if let v = filter.tagsAny, !v.isEmpty { out.append("any: \(v.joined(separator: " · "))") }
+        if let v = filter.colors, !v.isEmpty { out.append("color: \(v.joined(separator: "/"))") }
+        if let v = filter.freeText, !v.trimmingCharacters(in: .whitespaces).isEmpty {
+            out.append("text: \(v)")
+        }
+        return out
+    }
+}
+
 struct LibraryCard: View {
     let record: ScreenshotRecord
     @EnvironmentObject var store: LibraryStore
+    @EnvironmentObject var coordinator: IngestionCoordinator
+
+    private var isRegenerating: Bool {
+        coordinator.regeneratingIds.contains(record.id)
+    }
+    private var rosePrimary: Color {
+        Color(red: 1.0, green: 0.216, blue: 0.373)
+    }
 
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
@@ -181,8 +306,23 @@ struct LibraryCard: View {
         .cornerRadius(10)
         .overlay(
             RoundedRectangle(cornerRadius: 10)
-                .stroke(Color.secondary.opacity(0.18), lineWidth: 1)
+                .stroke(
+                    isRegenerating ? rosePrimary : Color.secondary.opacity(0.18),
+                    lineWidth: isRegenerating ? 1.5 : 1
+                )
         )
+        .overlay(alignment: .topTrailing) {
+            if isRegenerating {
+                Text("queued")
+                    .font(.system(size: 9, weight: .semibold))
+                    .tracking(0.5)
+                    .foregroundColor(.white)
+                    .padding(.horizontal, 8)
+                    .padding(.vertical, 3)
+                    .background(Capsule().fill(rosePrimary))
+                    .padding(8)
+            }
+        }
     }
 }
 
@@ -252,6 +392,84 @@ struct EmptyState: View {
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
         .padding(32)
+    }
+}
+
+/// Compact panel showing what's processing now and what's queued. Hidden
+/// when nothing is in flight and the queue is empty.
+struct ActivityBar: View {
+    @EnvironmentObject var coordinator: IngestionCoordinator
+
+    var body: some View {
+        if coordinator.inFlight == nil && coordinator.pending.isEmpty {
+            EmptyView()
+        } else {
+            VStack(alignment: .leading, spacing: 8) {
+                HStack(spacing: 10) {
+                    if let url = coordinator.inFlight {
+                        ProgressView()
+                            .controlSize(.small)
+                        VStack(alignment: .leading, spacing: 1) {
+                            Text("Indexing")
+                                .font(.caption2.weight(.semibold))
+                                .foregroundColor(.secondary)
+                            Text(url.lastPathComponent)
+                                .font(.caption.monospaced())
+                                .lineLimit(1)
+                                .truncationMode(.middle)
+                        }
+                    }
+                    Spacer()
+                    if !coordinator.pending.isEmpty {
+                        Text("\(coordinator.pending.count) queued")
+                            .font(.caption.weight(.medium))
+                            .foregroundColor(.secondary)
+                        Button("Clear queue") { coordinator.clearPending() }
+                            .buttonStyle(.borderless)
+                            .controlSize(.small)
+                    }
+                }
+
+                if !coordinator.pending.isEmpty {
+                    ScrollView(.horizontal, showsIndicators: false) {
+                        HStack(spacing: 6) {
+                            ForEach(coordinator.pending, id: \.self) { url in
+                                QueueChip(url: url) {
+                                    coordinator.cancel(url)
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            .padding(.horizontal, 16)
+            .padding(.vertical, 10)
+            .background(Color.secondary.opacity(0.06))
+        }
+    }
+}
+
+private struct QueueChip: View {
+    let url: URL
+    let onCancel: () -> Void
+
+    var body: some View {
+        HStack(spacing: 4) {
+            Text(url.lastPathComponent)
+                .font(.caption2.monospaced())
+                .lineLimit(1)
+                .truncationMode(.middle)
+            Button(action: onCancel) {
+                Image(systemName: "xmark.circle.fill")
+                    .font(.caption2)
+                    .foregroundColor(.secondary)
+            }
+            .buttonStyle(.plain)
+        }
+        .padding(.horizontal, 8)
+        .padding(.vertical, 4)
+        .background(Color.secondary.opacity(0.15))
+        .cornerRadius(6)
     }
 }
 

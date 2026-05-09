@@ -6,6 +6,8 @@ struct SettingsView: View {
     @EnvironmentObject var watcher: ScreenshotWatcher
     @EnvironmentObject var coordinator: IngestionCoordinator
 
+    @State private var availableModels: [String] = OllamaClient.knownGemmaModels
+
     var body: some View {
         ScrollView {
             VStack(alignment: .leading, spacing: 24) {
@@ -38,6 +40,54 @@ struct SettingsView: View {
                             watcher.start(folders: ScreenshotWatcher.defaultFolders)
                         }
                     }
+                }
+
+                section("Primary model") {
+                    HStack {
+                        Picker("", selection: $coordinator.primaryModel) {
+                            ForEach(availableModels, id: \.self) { Text($0).tag($0) }
+                        }
+                        .labelsHidden()
+                        .frame(maxWidth: 280)
+                        Spacer()
+                    }
+                    Text("Used for auto-ingest and the Detail view's Regenerate button. The Debug tab can pick a different model per slot.")
+                        .font(.caption)
+                        .foregroundColor(.secondary)
+                }
+
+                section("Extraction strategy") {
+                    Toggle(isOn: $coordinator.granularExtraction) {
+                        VStack(alignment: .leading, spacing: 1) {
+                            Text("Granular metadata")
+                                .font(.callout.weight(.medium))
+                            Text("Split metadata into 5 per-field calls (style, typography, layout, mood, tags). Slower but materially better with smaller models like gemma4:e4b.")
+                                .font(.caption)
+                                .foregroundColor(.secondary)
+                        }
+                    }
+                    Toggle(isOn: $coordinator.serialExecution) {
+                        VStack(alignment: .leading, spacing: 1) {
+                            Text("Serial execution")
+                                .font(.callout.weight(.medium))
+                            Text("Run one Ollama call at a time. Recommended on — parallel calls fight for the same KV cache and rarely speed things up on M-series Macs.")
+                                .font(.caption)
+                                .foregroundColor(.secondary)
+                        }
+                    }
+                    Toggle(isOn: $coordinator.urlFirstFlow) {
+                        VStack(alignment: .leading, spacing: 1) {
+                            Text("URL-first + chrome crop")
+                                .font(.callout.weight(.medium))
+                            Text("Run URL extraction before everything else; if a URL is found, crop the top 12% of the image (browser chrome) before metadata + palette + relevance. Off by default — uses the original parallel flow with no cropping.")
+                                .font(.caption)
+                                .foregroundColor(.secondary)
+                        }
+                    }
+                    Text("These settings apply to auto-ingest, Regenerate, and the default of new Debug slots — for both gemma4:26b and gemma4:e4b.")
+                        .font(.caption)
+                        .foregroundColor(.secondary)
+                        .padding(.top, 4)
                 }
 
                 section("Confidence threshold") {
@@ -102,6 +152,18 @@ struct SettingsView: View {
             }
             .padding(20)
             .frame(maxWidth: 720, alignment: .leading)
+        }
+        .task { await refreshModels() }
+    }
+
+    private func refreshModels() async {
+        do {
+            let installed = try await coordinator.agent.client.listModels()
+            let gemmas = installed.filter { $0.hasPrefix("gemma4") }
+            let merged = Array(Set(gemmas + OllamaClient.knownGemmaModels)).sorted()
+            await MainActor.run { availableModels = merged }
+        } catch {
+            // keep static list on failure
         }
     }
 

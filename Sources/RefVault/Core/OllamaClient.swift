@@ -19,24 +19,87 @@ struct OllamaClient {
         self.session = session
     }
 
-    /// Default model used when no override is supplied. The lighter `e4b`
-    /// variant runs comfortably on a 24GB-RAM Mac. Swap to `gemma4:26b` for
-    /// higher-quality but slower runs.
-    static let defaultModel = "gemma4:e4b"
+    /// Default model used when no override is supplied. `26b` MoE is the
+    /// quality target; `gemma4:e4b` is available as a faster A/B option in
+    /// the debug view.
+    static let defaultModel = "gemma4:26b"
 
     /// All gemma4 tags the UI knows about. Surfaced in the debug picker so
     /// the user can A/B between sizes.
     static let knownGemmaModels: [String] = [
-        "gemma4:e4b",
         "gemma4:e2b",
+        "gemma4:e4b",
         "gemma4:26b"
     ]
+
+    /// Mid-weight model used for the URL extraction call only — OCR of the
+    /// address bar. e2b returned false negatives (saying no URL exists when
+    /// one was clearly visible), so we step up to e4b which is still ~2-3×
+    /// faster than the 26b primary but reliable on chrome OCR.
+    static let defaultURLModel = "gemma4:e4b"
 
     /// Returns a copy of this client configured to talk to a different model.
     func withModel(_ name: String) -> OllamaClient {
         var copy = self
         copy.model = name
         return copy
+    }
+
+    /// Force-unload a model from VRAM by sending an empty-prompt /api/generate
+    /// with `keep_alive: 0`. Used by the Debug "Force Cold" toggle so each
+    /// run measures a true cold-load timing instead of riding warm weights
+    /// from the previous run.
+    func unload(model targetModel: String? = nil) async throws {
+        struct UnloadRequest: Encodable {
+            let model: String
+            let keep_alive: Int
+        }
+        let body = UnloadRequest(
+            model: targetModel ?? self.model,
+            keep_alive: 0
+        )
+        var req = URLRequest(url: baseURL.appendingPathComponent("api/generate"))
+        req.httpMethod = "POST"
+        req.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        req.httpBody = try JSONEncoder().encode(body)
+        req.timeoutInterval = 60
+
+        let started = Date()
+        Self.log("→ unload \(body.model)")
+        let (_, response) = try await session.data(for: req)
+        Self.log("← unload \(body.model) \(Self.fmt(Date().timeIntervalSince(started)))")
+        guard let http = response as? HTTPURLResponse, http.statusCode == 200 else {
+            throw RefVaultError.ollamaUnreachable("unload failed")
+        }
+    }
+
+    /// Pre-load a model into memory without running inference. Uses Ollama's
+    /// "empty prompt" semantics on /api/generate: when no prompt is sent and
+    /// `keep_alive` is -1, Ollama loads the weights and pins them. We call
+    /// this on app launch so the user's first ingest doesn't pay the ~55s
+    /// cold-load cost on the relevance call.
+    func preload(model targetModel: String? = nil) async throws {
+        struct PreloadRequest: Encodable {
+            let model: String
+            let keep_alive: Int
+        }
+        let body = PreloadRequest(
+            model: targetModel ?? self.model,
+            keep_alive: -1
+        )
+        var req = URLRequest(url: baseURL.appendingPathComponent("api/generate"))
+        req.httpMethod = "POST"
+        req.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        req.httpBody = try JSONEncoder().encode(body)
+        req.timeoutInterval = 120
+
+        let started = Date()
+        Self.log("→ preload \(body.model)")
+        let (_, response) = try await session.data(for: req)
+        Self.log("← preload \(body.model) \(Self.fmt(Date().timeIntervalSince(started)))")
+        guard let http = response as? HTTPURLResponse, http.statusCode == 200 else {
+            throw RefVaultError.ollamaUnreachable("preload failed")
+        }
     }
 
     /// Health check — returns the list of locally pulled model tags.
@@ -74,6 +137,24 @@ struct OllamaClient {
             imageBase64: imageBase64,
             temperature: temperature
         )
+        return try Self.decodeJSON(raw: raw, as: type)
+    }
+
+    /// Text-only variant — no image, used by helpers like the search-query
+    /// parser. Same JSON-mode contract as the vision path.
+    func generateTextJSON<T: Decodable>(
+        prompt: String,
+        as type: T.Type,
+        temperature: Double = 0.0
+    ) async throws -> (decoded: T, raw: String) {
+        let raw = try await generateText(prompt: prompt, temperature: temperature)
+        return try Self.decodeJSON(raw: raw, as: type)
+    }
+
+    private static func decodeJSON<T: Decodable>(
+        raw: String,
+        as type: T.Type
+    ) throws -> (decoded: T, raw: String) {
         let cleaned = Self.extractJSONObject(from: raw)
         guard let data = cleaned.data(using: .utf8) else {
             throw RefVaultError.modelOutputNotJSON(raw)
@@ -100,6 +181,11 @@ struct OllamaClient {
             let format: String
             let think: Bool
             let options: [String: Double]
+            // -1 → never unload; "30m" → unload after 30 idle minutes.
+            // We use -1 because the 26b's cold-load is ~55s and macOS will
+            // keep paging it out under memory pressure even within Ollama's
+            // default 5-min keep-alive — pinning forces it to stay touched.
+            let keep_alive: Int
         }
         struct GenerateResponse: Decodable {
             let response: String
@@ -115,7 +201,8 @@ struct OllamaClient {
             stream: false,
             format: "json",
             think: false,
-            options: ["temperature": temperature]
+            options: ["temperature": temperature],
+            keep_alive: -1
         )
 
         var req = URLRequest(url: baseURL.appendingPathComponent("api/generate"))
@@ -124,13 +211,88 @@ struct OllamaClient {
         req.httpBody = try JSONEncoder().encode(body)
         req.timeoutInterval = 180
 
+        let promptHead = String(prompt.prefix(40)).replacingOccurrences(of: "\n", with: " ")
+        let started = Date()
+        Self.log("→ \(model) [\(promptHead)…] image=\(imageBase64.count)B")
+
         let (data, response): (Data, URLResponse)
         do {
             (data, response) = try await session.data(for: req)
         } catch {
+            Self.log("✗ \(model) [\(promptHead)…] error after \(Self.fmt(Date().timeIntervalSince(started)))")
             throw RefVaultError.ollamaUnreachable(error.localizedDescription)
         }
+        let elapsed = Date().timeIntervalSince(started)
 
+        guard let http = response as? HTTPURLResponse else {
+            throw RefVaultError.ollamaUnreachable("no HTTPURLResponse")
+        }
+        if http.statusCode != 200 {
+            throw RefVaultError.ollamaHTTPError(
+                http.statusCode,
+                String(data: data, encoding: .utf8) ?? ""
+            )
+        }
+        Self.log("← \(model) [\(promptHead)…] \(Self.fmt(elapsed))")
+        let decoded = try JSONDecoder().decode(GenerateResponse.self, from: data)
+        return decoded.response
+    }
+
+    private static func log(_ msg: String) {
+        FileHandle.standardError.write(Data("[Ollama] \(msg)\n".utf8))
+    }
+
+    private static func fmt(_ s: TimeInterval) -> String {
+        String(format: "%.2fs", s)
+    }
+
+    /// Text-only generate. Mirrors `generateRaw` but omits the `images`
+    /// payload so the prompt is purely textual.
+    func generateText(
+        prompt: String,
+        temperature: Double = 0.0
+    ) async throws -> String {
+        struct GenerateRequest: Encodable {
+            let model: String
+            let prompt: String
+            let stream: Bool
+            let format: String
+            let think: Bool
+            let options: [String: Double]
+            let keep_alive: Int
+        }
+        struct GenerateResponse: Decodable {
+            let response: String
+        }
+
+        let body = GenerateRequest(
+            model: model,
+            prompt: prompt,
+            stream: false,
+            format: "json",
+            think: false,
+            options: ["temperature": temperature],
+            keep_alive: -1
+        )
+
+        var req = URLRequest(url: baseURL.appendingPathComponent("api/generate"))
+        req.httpMethod = "POST"
+        req.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        req.httpBody = try JSONEncoder().encode(body)
+        req.timeoutInterval = 60
+
+        let promptHead = String(prompt.prefix(40)).replacingOccurrences(of: "\n", with: " ")
+        let started = Date()
+        Self.log("→ \(model) [\(promptHead)…] text-only")
+
+        let (data, response): (Data, URLResponse)
+        do {
+            (data, response) = try await session.data(for: req)
+        } catch {
+            Self.log("✗ \(model) [\(promptHead)…] error after \(Self.fmt(Date().timeIntervalSince(started)))")
+            throw RefVaultError.ollamaUnreachable(error.localizedDescription)
+        }
+        Self.log("← \(model) [\(promptHead)…] \(Self.fmt(Date().timeIntervalSince(started)))")
         guard let http = response as? HTTPURLResponse else {
             throw RefVaultError.ollamaUnreachable("no HTTPURLResponse")
         }

@@ -1,0 +1,20 @@
+Identify the typography in this design reference. Categorize every visible
+text by its role.
+
+Return ONLY this JSON:
+{
+  "headings": ["..."],
+  "bodies":   ["..."],
+  "others":   ["..."]
+}
+
+Rules:
+- Use [] for any axis with no visible text in that role.
+- Values can be families ("Inter", "Söhne") or generic categories
+  ("serif", "sans-serif", "mono", "display", "rounded sans") or short
+  style notes ("condensed grotesque", "italic serif").
+- Don't invent typefaces. If you can't recognize a specific family, use a
+  generic category.
+- A single typeface used across roles can repeat in multiple axes.
+
+Strict JSON, no prose.

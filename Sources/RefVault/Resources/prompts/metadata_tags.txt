@@ -1,0 +1,19 @@
+Generate 5–15 specific tags that capture the visual content of this design
+reference. Each tag MUST be a single word — no hyphens, no spaces, no
+punctuation. Use lowercase letters and digits only.
+
+Return ONLY this JSON:
+{ "tags": ["...", "...", "..."] }
+
+Good tags name visible features, components, or vibes — broken into
+single-word tokens (split compound concepts):
+- "hero", "pricing", "dashboard", "cardgrid", "splitscreen"
+- "serif", "monospace", "ligatures"
+- "highcontrast", "neon", "pastels", "muted"
+- "illustration", "3d", "render", "collage", "photo"
+- "darkmode", "minimal", "editorial", "grid"
+
+When a concept naturally splits into two ideas, emit both as separate
+tags ("dark", "mode") instead of "dark-mode". When it's a unitary noun
+("dashboard", "neon"), keep it as one word. Avoid generic words
+("design", "website", "image"). Strict JSON, no prose.

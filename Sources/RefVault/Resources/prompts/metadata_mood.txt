@@ -1,0 +1,12 @@
+Describe the mood of this design reference using 2–3 adjectives.
+
+Return ONLY this JSON:
+{ "mood": "..." }
+
+Examples of good values:
+- "calm, professional, trustworthy"
+- "energetic, playful, vibrant"
+- "luxurious, refined, dark"
+- "warm, friendly, approachable"
+
+Strict JSON, no prose.

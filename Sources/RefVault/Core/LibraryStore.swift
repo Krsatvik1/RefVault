@@ -59,8 +59,15 @@ final class LibraryStore: ObservableObject {
     }
 
     /// Copy the source image into the library and persist a new record.
+    /// `processingSeconds` is the wall-clock time the agent took to produce
+    /// `result` — captured by the coordinator and stored on the record so
+    /// the detail view can show "Indexed in 8.2s".
     @discardableResult
-    func saveRecord(from result: AgentResult, sourceURL: URL) -> ScreenshotRecord? {
+    func saveRecord(
+        from result: AgentResult,
+        sourceURL: URL,
+        processingSeconds: Double? = nil
+    ) -> ScreenshotRecord? {
         let dimensions = imageDimensions(for: sourceURL)
         let storedFileName: String
         do {
@@ -82,7 +89,8 @@ final class LibraryStore: ObservableObject {
             relevance: result.relevance,
             metadata: result.metadata,
             palette: result.palette,
-            visibleURL: result.visibleURL
+            visibleURL: result.visibleURL,
+            processingSeconds: processingSeconds
         )
         records.insert(record, at: 0)
         persist()
@@ -93,7 +101,11 @@ final class LibraryStore: ObservableObject {
     /// palette, URL). Keeps id, file paths, and capture/index dates. Used by
     /// the debug regenerate flow.
     @discardableResult
-    func update(record: ScreenshotRecord, with result: AgentResult) -> ScreenshotRecord? {
+    func update(
+        record: ScreenshotRecord,
+        with result: AgentResult,
+        processingSeconds: Double? = nil
+    ) -> ScreenshotRecord? {
         guard let idx = records.firstIndex(where: { $0.id == record.id }) else {
             return nil
         }
@@ -103,6 +115,9 @@ final class LibraryStore: ObservableObject {
         updated.palette = result.palette
         updated.visibleURL = result.visibleURL
         updated.indexedAt = Date()
+        if let s = processingSeconds {
+            updated.processingSeconds = s
+        }
         records[idx] = updated
         persist()
         return updated
@@ -114,6 +129,51 @@ final class LibraryStore: ObservableObject {
         }
         records.removeAll(where: { $0.id == record.id })
         persist()
+    }
+
+    /// Distinct values seen across the library, ordered by frequency (most
+    /// common first). Fed into the search prompt so Gemma maps free-text
+    /// queries onto values that *actually exist* in the library, instead of
+    /// inventing close-but-wrong synonyms ("editorial" vs "magazine-style").
+    var vocabulary: LibraryVocabulary {
+        var styleHits: [String: Int] = [:]
+        var moodHits: [String: Int] = [:]
+        var layoutHits: [String: Int] = [:]
+        var tagHits: [String: Int] = [:]
+        var surfaceHits: [String: Int] = [:]
+        var deviceHits: [String: Int] = [:]
+
+        for r in records {
+            let s = r.relevance.surface.lowercased()
+            if !s.isEmpty { surfaceHits[s, default: 0] += 1 }
+            let d = r.relevance.device.lowercased()
+            if !d.isEmpty { deviceHits[d, default: 0] += 1 }
+            guard let m = r.metadata else { continue }
+            if !m.style.isEmpty { styleHits[m.style.lowercased(), default: 0] += 1 }
+            if !m.mood.isEmpty { moodHits[m.mood.lowercased(), default: 0] += 1 }
+            if !m.layout.isEmpty { layoutHits[m.layout.lowercased(), default: 0] += 1 }
+            for t in m.tags where !t.isEmpty {
+                tagHits[t.lowercased(), default: 0] += 1
+            }
+        }
+
+        func sorted(_ d: [String: Int], cap: Int) -> [String] {
+            d.sorted { lhs, rhs in
+                if lhs.value != rhs.value { return lhs.value > rhs.value }
+                return lhs.key < rhs.key
+            }
+            .prefix(cap)
+            .map { $0.key }
+        }
+
+        return LibraryVocabulary(
+            styles: sorted(styleHits, cap: 80),
+            moods: sorted(moodHits, cap: 80),
+            layouts: sorted(layoutHits, cap: 80),
+            tags: sorted(tagHits, cap: 200),
+            surfaces: sorted(surfaceHits, cap: 20),
+            devices: sorted(deviceHits, cap: 10)
+        )
     }
 
     /// Filter records against a free-text query. Matches across tags, style,
@@ -128,6 +188,126 @@ final class LibraryStore: ObservableObject {
         }
     }
 
+    /// Apply a Gemma-parsed structured filter. Each populated axis acts as
+    /// an AND constraint; lists within a single axis are OR'd.
+    func search(filter: SearchFilter) -> [ScreenshotRecord] {
+        guard !filter.isEmpty else { return records }
+        return records.filter { rec in matches(rec, filter: filter) }
+    }
+
+    private func matches(_ rec: ScreenshotRecord, filter f: SearchFilter) -> Bool {
+        if let surfaces = f.surfaces, !surfaces.isEmpty,
+           !surfaces.map({ $0.lowercased() }).contains(rec.relevance.surface.lowercased()) {
+            return false
+        }
+        if let devices = f.devices, !devices.isEmpty,
+           !devices.map({ $0.lowercased() }).contains(rec.relevance.device.lowercased()) {
+            return false
+        }
+        if let orientations = f.orientations, !orientations.isEmpty,
+           !orientations.map({ $0.lowercased() }).contains(rec.orientation.lowercased()) {
+            return false
+        }
+        if let styles = f.styles, !styles.isEmpty {
+            let s = rec.metadata?.style.lowercased() ?? ""
+            if !styles.contains(where: { s.contains($0.lowercased()) }) { return false }
+        }
+        if let moods = f.moods, !moods.isEmpty {
+            let m = rec.metadata?.mood.lowercased() ?? ""
+            if !moods.contains(where: { m.contains($0.lowercased()) }) { return false }
+        }
+        let recTags = Set((rec.metadata?.tags ?? []).map { $0.lowercased() })
+        if let all = f.tagsAll, !all.isEmpty {
+            let needed = all.map { $0.lowercased() }
+            if !needed.allSatisfy({ recTags.contains($0) }) { return false }
+        }
+        if let any = f.tagsAny, !any.isEmpty {
+            let candidates = any.map { $0.lowercased() }
+            var extended = recTags
+                .union([rec.metadata?.style, rec.metadata?.mood, rec.metadata?.layout]
+                    .compactMap { $0?.lowercased() })
+            for term in rec.metadata?.typography.allTerms ?? [] {
+                extended.insert(term.lowercased())
+            }
+            if !candidates.contains(where: { extended.contains($0) }) { return false }
+        }
+        if let colors = f.colors, !colors.isEmpty {
+            if !colorMatches(rec, terms: colors) { return false }
+        }
+        if let free = f.freeText?.trimmingCharacters(in: .whitespaces), !free.isEmpty {
+            let haystack = haystackString(for: rec)
+            let terms = free.lowercased().split(separator: " ").map(String.init)
+            if !terms.allSatisfy({ haystack.contains($0) }) { return false }
+        }
+        return true
+    }
+
+    private func colorMatches(_ rec: ScreenshotRecord, terms: [String]) -> Bool {
+        let palette = rec.palette?.all ?? []
+        guard !palette.isEmpty else { return false }
+        // Fuzzy color-family lookup: "brown" matches light/mid/dark browns.
+        let paletteFamilies: Set<String> = palette.reduce(into: []) { acc, hex in
+            for f in ColorNamer.families(for: hex) { acc.insert(f) }
+        }
+        for term in terms.map({ $0.lowercased() }) {
+            if term.hasPrefix("#") {
+                if palette.contains(where: { $0.lowercased() == term }) { return true }
+                continue
+            }
+            switch term {
+            case "dark":
+                if palette.contains(where: { paletteIsDark($0) }) { return true }
+            case "light":
+                if palette.contains(where: { paletteIsLight($0) }) { return true }
+            case "warm":
+                if palette.contains(where: { paletteIsWarm($0) }) { return true }
+            case "cool":
+                if palette.contains(where: { paletteIsCool($0) }) { return true }
+            default:
+                if paletteFamilies.contains(term) { return true }
+                // Last resort: substring against the palette / mood string.
+                let hay = (palette + [rec.metadata?.mood ?? ""])
+                    .joined(separator: " ").lowercased()
+                if hay.contains(term) { return true }
+            }
+        }
+        return false
+    }
+
+    private func rgbComponents(_ hex: String) -> (Double, Double, Double)? {
+        var s = hex.trimmingCharacters(in: .whitespacesAndNewlines)
+        if s.hasPrefix("#") { s.removeFirst() }
+        guard s.count == 6, let v = UInt32(s, radix: 16) else { return nil }
+        return (
+            Double((v >> 16) & 0xff) / 255,
+            Double((v >> 8) & 0xff) / 255,
+            Double(v & 0xff) / 255
+        )
+    }
+
+    private func luminance(_ hex: String) -> Double? {
+        guard let (r, g, b) = rgbComponents(hex) else { return nil }
+        return 0.2126 * r + 0.7152 * g + 0.0722 * b
+    }
+
+    private func paletteIsDark(_ hex: String) -> Bool {
+        (luminance(hex) ?? 1) < 0.25
+    }
+
+    private func paletteIsLight(_ hex: String) -> Bool {
+        (luminance(hex) ?? 0) > 0.75
+    }
+
+    private func paletteIsWarm(_ hex: String) -> Bool {
+        guard let (r, _, b) = rgbComponents(hex) else { return false }
+        return r - b > 0.10
+    }
+
+    private func paletteIsCool(_ hex: String) -> Bool {
+        guard let (r, _, b) = rgbComponents(hex) else { return false }
+        return b - r > 0.10
+    }
+
     private func haystackString(for rec: ScreenshotRecord) -> String {
         var parts: [String] = [
             rec.relevance.surface,
@@ -136,7 +316,8 @@ final class LibraryStore: ObservableObject {
             rec.orientation
         ]
         if let m = rec.metadata {
-            parts.append(contentsOf: [m.style, m.typography, m.layout, m.mood])
+            parts.append(contentsOf: [m.style, m.layout, m.mood])
+            parts.append(contentsOf: m.typography.allTerms)
             parts.append(contentsOf: m.tags)
         }
         if let url = rec.visibleURL?.url { parts.append(url) }
