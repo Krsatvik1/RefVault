@@ -61,11 +61,11 @@ jobs:
       # release). Useful for debugging when a release upload fails or
       # when the user wants the .dmg from a feature-branch run that
       # didn't trigger a release.
-      - name: Upload DMG as workflow artifact
+      - name: Upload ZIP as workflow artifact
         uses: actions/upload-artifact@v4
         with:
           name: RefVault-${{ steps.version.outputs.version }}
-          path: dist/RefVault.dmg
+          path: dist/RefVault.zip
           if-no-files-found: error
           retention-days: 14
 
@@ -83,11 +83,13 @@ jobs:
             Auto-built from [`${{ github.sha }}`](https://github.com/${{ github.repository }}/commit/${{ github.sha }}) at ${{ steps.version.outputs.version }}.
 
             ## Install
-            1. Download `RefVault.dmg` below.
-            2. Open it and drag `RefVault` into `Applications`.
-            3. First launch will be blocked — open System Settings → Privacy & Security → click **Open Anyway**, then re-launch.
-            4. The app will download Gemma 4 26B (~15 GB) on first run; this is normal.
-          files: dist/RefVault.dmg
+            1. Download `RefVault.zip` below. Safari will auto-extract it; if you used another browser, double-click to extract.
+            2. Drag `RefVault.app` into `/Applications`.
+            3. First launch will be blocked: macOS will say *"Apple could not verify..."* — click **Done**.
+            4. Open **System Settings → Privacy & Security**, scroll to the Security section, click **Open Anyway** next to the RefVault notice.
+            5. Try launching again from `/Applications`, click **Open** in the confirmation dialog.
+            6. The app will download Gemma 4 26B (~15 GB) on first run — this is one-time and shows progress.
+          files: dist/RefVault.zip
           prerelease: false
           # `latest` tag rolls forward on every push — let GitHub mark
           # this as the repo's latest release so the .../releases/latest

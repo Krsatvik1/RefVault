@@ -145,38 +145,22 @@ if [[ "$STOP_AFTER" == "app" ]]; then
     exit 0
 fi
 
-# ─── 3. Package the .dmg ─────────────────────────────────────────────
-# Bare layout: .app + /Applications symlink + READ ME. No AppleScript
-# Finder window-positioning dance — that triggers an Automation TCC
-# prompt that breaks unattended builds.
-echo "▶ packaging RefVault.dmg"
-DMG_STAGE="$(mktemp -d)"
-trap 'rm -rf "$STAGE" "$DMG_STAGE"' EXIT
-cp -R "$DIST/RefVault.app" "$DMG_STAGE/"
-ln -s /Applications "$DMG_STAGE/Applications"
-cat > "$DMG_STAGE/READ ME FIRST.txt" <<'EOF'
-Installing RefVault
--------------------
+# ─── 3. Package the .zip ─────────────────────────────────────────────
+# Why ZIP and not DMG: macOS Sequoia (15+) added a Gatekeeper check on
+# disk images themselves. A quarantined, ad-hoc signed .dmg trips that
+# check on mount with "Apple could not verify ... is free of malware"
+# — separate from the .app's own unidentified-developer prompt — and
+# the user has to approve BOTH (DMG and .app) via System Settings.
+# ZIPs aren't subject to the disk-image check, so the user only deals
+# with one Privacy & Security override (for the .app) instead of two.
+#
+# `ditto -c -k --keepParent` is the only zip implementation on macOS
+# that correctly preserves bundle structure, symlinks, extended
+# attributes, and the codesign seal. Plain `zip` corrupts at least
+# one of those and the extracted .app fails to launch.
+echo "▶ packaging RefVault.zip"
+ZIP="$DIST/RefVault.zip"
+rm -f "$ZIP"
+ditto -c -k --keepParent "$DIST/RefVault.app" "$ZIP"
 
-1. Drag RefVault into the Applications folder.
-2. Try to launch RefVault. macOS will block it the first time with a
-   message about an unidentified developer (or "is damaged").
-3. Open System Settings → Privacy & Security. Scroll down — you'll see
-   "RefVault was blocked from use." Click "Open Anyway."
-4. Try launching RefVault again. Click "Open" in the confirmation
-   dialog.
-
-RefVault is signed with an ad-hoc certificate (no Apple Developer
-account yet), which is why macOS is cautious. Once approved once,
-future launches go straight through.
-
-First-run setup will download the Gemma 4 26B model (~15 GB). The app
-shows progress while this happens. Don't quit during the download.
-EOF
-
-DMG="$DIST/RefVault.dmg"
-rm -f "$DMG"
-hdiutil create -volname "RefVault" -srcfolder "$DMG_STAGE" -ov -format UDZO -fs HFS+ "$DMG" >/dev/null
-codesign --force --sign - "$DMG" 2>/dev/null || true
-
-echo "▶ built $DMG ($(du -sh "$DMG" | awk '{print $1}'))"
+echo "▶ built $ZIP ($(du -sh "$ZIP" | awk '{print $1}'))"
