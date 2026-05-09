@@ -9,9 +9,19 @@ import Foundation
 @MainActor
 final class SearchModel: ObservableObject {
     @Published var query: String = ""
+    /// The query value that the grid actually filters by. Diverges from
+    /// `query` while the user is mid-typing: only updates after the
+    /// debounce window expires or when the user explicitly hits Enter.
+    /// Without this the LibraryView grid was filtering on every keystroke,
+    /// which made the grid feel jumpy.
+    @Published private(set) var committedQuery: String = ""
     @Published private(set) var parsedFilter: SearchFilter? = nil
     @Published private(set) var parsedFilterFor: String = ""
     @Published private(set) var isParsing: Bool = false
+    /// Wall-clock start of the current Gemma parse, set after the debounce
+    /// sleep clears. Drives the live "+Ns" counter in the search field.
+    /// Nil whenever no parse is in flight.
+    @Published private(set) var parseStartedAt: Date? = nil
     @Published private(set) var parseError: String? = nil
     /// Tag chips the user has explicitly toggled on. Acts as an additional
     /// AND-constraint over whatever the AI parsed from the free-text query.
@@ -69,43 +79,33 @@ final class SearchModel: ObservableObject {
 
     func clear() {
         query = ""
+        committedQuery = ""
         parsedFilter = nil
         parsedFilterFor = ""
         isParsing = false
+        parseStartedAt = nil
         parseError = nil
         parseTask?.cancel()
     }
 
-    /// Debounce window before a typing pause counts as "user is done." Set
-    /// long enough that mid-word pauses don't fire a Gemma call but short
-    /// enough that hands-off-keyboard feels responsive. 1.5s is the
-    /// Spotlight/Raycast default ballpark.
-    private static let debounceNanos: UInt64 = 1_500_000_000
-
-    /// Caller (the view's `.onChange`) invokes this after the binding writes.
-    /// Done this way so the binding write doesn't fan out into a flurry of
-    /// objectWillChange events from inside `didSet`, which was destroying
-    /// the TextField's selection state mid-typing. The actual Gemma call is
-    /// deferred by `debounceNanos` and cancelled if the user keeps typing.
+    /// Called from the TextField's `.onChange`. Only reacts to the field
+    /// being cleared — actual search/parse work is gated behind Enter
+    /// (submit). Without this, every keystroke was either rescheduling a
+    /// debounced parse or committing a substring filter; user wanted full
+    /// manual control so the grid only updates on explicit confirmation.
     func schedule(_ newQuery: String) {
-        parseTask?.cancel()
-        parseError = nil
         let trimmed = newQuery.trimmingCharacters(in: .whitespacesAndNewlines)
         if trimmed.isEmpty {
+            parseTask?.cancel()
+            parseError = nil
             parsedFilter = nil
             parsedFilterFor = ""
+            committedQuery = ""
+            selectedTags = []
             isParsing = false
-            return
         }
-        guard trimmed.count >= 3, let parser = parser else {
-            // Need at least 3 chars before bothering Gemma — single letters
-            // don't carry enough signal and we'd just thrash the model.
-            parsedFilter = nil
-            parsedFilterFor = ""
-            isParsing = false
-            return
-        }
-        parseTask = launchParse(trimmed: trimmed, originalQuery: newQuery, delay: Self.debounceNanos, parser: parser)
+        // Non-empty: do nothing. The user has to press Enter (or click
+        // the submit button) to commit the query.
     }
 
     /// Bypass the debounce — used when the user explicitly hits ⏎ in the
@@ -113,6 +113,12 @@ final class SearchModel: ObservableObject {
     func submit() {
         parseTask?.cancel()
         let trimmed = query.trimmingCharacters(in: .whitespacesAndNewlines)
+        // Fresh slate — every new search wipes existing chips before the
+        // parse runs, so AI-promoted chips can replace them cleanly.
+        selectedTags = []
+        // Commit immediately so the substring filter applies even before
+        // Gemma returns (or if Gemma fails entirely).
+        committedQuery = trimmed
         guard !trimmed.isEmpty, let parser = parser else { return }
         parseTask = launchParse(trimmed: trimmed, originalQuery: query, delay: 0, parser: parser)
     }
@@ -128,13 +134,64 @@ final class SearchModel: ObservableObject {
                 try? await Task.sleep(nanoseconds: delay)
             }
             if Task.isCancelled { return }
+            // Debounce passed — commit the query so the substring filter
+            // kicks in immediately, in parallel with the (slower) Gemma
+            // parse. If the parse succeeds, parsedFilter takes precedence
+            // in LibraryView.currentResults; if it fails, the substring
+            // filter is the fallback.
+            self.committedQuery = trimmed
+            // Fresh slate at commit — new search clears any existing
+            // chips before Gemma's parsed values land. If parse succeeds
+            // below, selectedTags is set to the new normalized set; if
+            // parse fails, chips stay empty and substring search drives
+            // the grid via committedQuery alone.
+            self.selectedTags = []
             self.isParsing = true
-            defer { self.isParsing = false }
+            self.parseStartedAt = Date()
+            defer {
+                self.isParsing = false
+                self.parseStartedAt = nil
+            }
             do {
                 let filter = try await parser.parse(query: trimmed)
                 if Task.isCancelled || self.query != originalQuery { return }
                 self.parsedFilter = filter
                 self.parsedFilterFor = originalQuery
+                // Promote every categorical value Gemma extracted into the
+                // selectedTags set so it renders through the same chip row
+                // the user's manual toggles use. Without this we had two
+                // parallel chip styles ("clean ×" pills above, "mood: edgy"
+                // labelled chips below) for the same conceptual thing.
+                // freeText stays out — that's the substring fallback path
+                // (driven by committedQuery), not a chip.
+                var promoted = Set<String>()
+                if let v = filter.styles       { promoted.formUnion(v) }
+                if let v = filter.moods        { promoted.formUnion(v) }
+                if let v = filter.tagsAll      { promoted.formUnion(v) }
+                if let v = filter.tagsAny      { promoted.formUnion(v) }
+                if let v = filter.colors       { promoted.formUnion(v) }
+                if let v = filter.surfaces     { promoted.formUnion(v) }
+                if let v = filter.devices      { promoted.formUnion(v) }
+                if let v = filter.orientations { promoted.formUnion(v) }
+                // Typography lands as slot-qualified tokens so a record
+                // with serif headings + sans-serif body can be filtered
+                // by either slot independently. Format mirrors how
+                // chipHaystack stores typography for the same record.
+                if let t = filter.typography {
+                    if let v = t.headings {
+                        promoted.formUnion(v.map { "heading: \($0.lowercased())" })
+                    }
+                    if let v = t.bodies {
+                        promoted.formUnion(v.map { "body: \($0.lowercased())" })
+                    }
+                    if let v = t.others {
+                        promoted.formUnion(v.map { "other: \($0.lowercased())" })
+                    }
+                }
+                let normalized = promoted.map {
+                    $0.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+                }.filter { !$0.isEmpty }
+                self.selectedTags.formUnion(normalized)
             } catch {
                 if !Task.isCancelled {
                     self.parseError = error.localizedDescription

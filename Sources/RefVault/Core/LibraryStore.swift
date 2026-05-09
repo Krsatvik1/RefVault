@@ -28,7 +28,7 @@ final class LibraryStore: ObservableObject {
         self.libraryFile = dir.appendingPathComponent("library.json")
 
         let stored = UserDefaults.standard.object(forKey: Self.thresholdKey) as? Double
-        self.confidenceThreshold = stored ?? 0.5
+        self.confidenceThreshold = stored ?? 0.95
 
         try? FileManager.default.createDirectory(
             at: imagesDir,
@@ -278,6 +278,74 @@ final class LibraryStore: ObservableObject {
             tags: sorted(tagHits, cap: 200),
             surfaces: sorted(surfaceHits, cap: 20),
             devices: sorted(deviceHits, cap: 10)
+        )
+    }
+
+    /// Unified pool of attributes shown as flat chips in the library /
+    /// popover tags row — style, mood, layout, tags, surface, device,
+    /// orientation. Typography lives in its own dropdown menu, color in
+    /// its own picker; both excluded here. De-duplicated, lowercased,
+    /// ranked by frequency. Filtering happens via `chipHaystack(for:)`,
+    /// which matches all of these attributes.
+    var chipVocabulary: [String] {
+        var hits: [String: Int] = [:]
+        for r in records {
+            let s = r.relevance.surface.lowercased()
+            if !s.isEmpty { hits[s, default: 0] += 1 }
+            let d = r.relevance.device.lowercased()
+            if !d.isEmpty { hits[d, default: 0] += 1 }
+            let o = r.orientation.lowercased()
+            if !o.isEmpty { hits[o, default: 0] += 1 }
+            guard let m = r.metadata else { continue }
+            if !m.style.isEmpty { hits[m.style.lowercased(), default: 0] += 1 }
+            if !m.mood.isEmpty { hits[m.mood.lowercased(), default: 0] += 1 }
+            if !m.layout.isEmpty { hits[m.layout.lowercased(), default: 0] += 1 }
+            for t in m.tags where !t.isEmpty {
+                hits[t.lowercased(), default: 0] += 1
+            }
+        }
+        return hits.sorted { lhs, rhs in
+            if lhs.value != rhs.value { return lhs.value > rhs.value }
+            return lhs.key < rhs.key
+        }.map { $0.key }
+    }
+
+    /// Typography fonts grouped by their record-level slot (heading /
+    /// body / other). Each section is de-duplicated and ranked by
+    /// frequency. Drives the typography dropdown that mirrors the color
+    /// picker.
+    struct TypographyVocabulary {
+        var headings: [String]
+        var bodies: [String]
+        var others: [String]
+        var isEmpty: Bool { headings.isEmpty && bodies.isEmpty && others.isEmpty }
+    }
+    var typographyVocabulary: TypographyVocabulary {
+        var headHits: [String: Int] = [:]
+        var bodyHits: [String: Int] = [:]
+        var otherHits: [String: Int] = [:]
+        for r in records {
+            guard let m = r.metadata else { continue }
+            for f in m.typography.headings where !f.isEmpty {
+                headHits[f, default: 0] += 1
+            }
+            for f in m.typography.bodies where !f.isEmpty {
+                bodyHits[f, default: 0] += 1
+            }
+            for f in m.typography.others where !f.isEmpty {
+                otherHits[f, default: 0] += 1
+            }
+        }
+        func sorted(_ d: [String: Int]) -> [String] {
+            d.sorted { lhs, rhs in
+                if lhs.value != rhs.value { return lhs.value > rhs.value }
+                return lhs.key < rhs.key
+            }.map { $0.key }
+        }
+        return TypographyVocabulary(
+            headings: sorted(headHits),
+            bodies: sorted(bodyHits),
+            others: sorted(otherHits)
         )
     }
 

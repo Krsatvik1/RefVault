@@ -16,6 +16,48 @@ final class RefVaultAppDelegate: NSObject, NSApplicationDelegate {
     func applicationDidFinishLaunching(_ notification: Notification) {
         NSApp.setActivationPolicy(.regular)
         NSApp.activate(ignoringOtherApps: true)
+
+        // Replace the default Swift-runner dock icon with our own. Loaded
+        // at runtime instead of via Info.plist because SwiftPM executables
+        // don't ship an Asset Catalog. PNG @1024 is the recommended source
+        // — macOS scales it down for the dock and the application
+        // switcher and applies the rounded-square mask itself.
+        let appIconURL = Bundle.module.url(
+            forResource: "AppIcon",
+            withExtension: "png",
+            subdirectory: "Resources/icons"
+        ) ?? Bundle.module.url(
+            forResource: "AppIcon",
+            withExtension: "png"
+        )
+        if let url = appIconURL, let img = NSImage(contentsOf: url) {
+            // Apple's icon template expects the artwork to occupy ~80% of
+            // a 1024×1024 canvas (824×824 with 100px transparent padding
+            // on each side). Our Paper export fills the full canvas, so
+            // it renders bigger than every other dock icon. Composite it
+            // into a properly padded transparent canvas so the dock sees
+            // it at the standard size.
+            let canvasSide: CGFloat = 1024
+            let artworkSide: CGFloat = 824
+            let padding = (canvasSide - artworkSide) / 2
+            let canvas = NSImage(size: NSSize(width: canvasSide, height: canvasSide))
+            canvas.lockFocus()
+            img.draw(
+                in: NSRect(x: padding, y: padding, width: artworkSide, height: artworkSide),
+                from: .zero,
+                operation: .copy,
+                fraction: 1.0
+            )
+            canvas.unlockFocus()
+            NSApp.applicationIconImage = canvas
+            FileHandle.standardError.write(Data(
+                "[Icon] dock icon set from \(url.path) (rescaled to Apple template proportions)\n".utf8
+            ))
+        } else {
+            FileHandle.standardError.write(Data(
+                "[Icon] AppIcon.png not found in bundle — drop it at Sources/RefVault/Resources/icons/AppIcon.png\n".utf8
+            ))
+        }
     }
 
     func applicationShouldTerminateAfterLastWindowClosed(
@@ -29,12 +71,48 @@ final class RefVaultAppDelegate: NSObject, NSApplicationDelegate {
         guard statusItem == nil else { return }
 
         let item = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
-        let img = NSImage(
-            systemSymbolName: "photo.stack",
-            accessibilityDescription: "RefVault"
-        )
-        img?.isTemplate = true
-        item.button?.image = img
+
+        // Custom menu-bar mark from Resources/icons. Try SVG first (vector,
+        // scales cleanly across Retina + dark/light mode), then fall back
+        // to PDF (also vector, more battle-tested as a template), then to
+        // the SF Symbol if neither file is present yet — that keeps the
+        // build runnable before the icon export lands.
+        // isTemplate=true makes macOS auto-tint the glyph: white on a dark
+        // menu bar, black on a light menu bar. The source SVG/PDF must be
+        // monochrome black on transparent for templating to work right.
+        let menuIcon: NSImage? = {
+            for ext in ["svg", "pdf", "png"] {
+                // Try subdirectory lookup first (most reliable with
+                // SwiftPM's .copy rule), then a bare-name search that
+                // walks the bundle recursively. Either path works once
+                // the file is in place; covers both layouts in case the
+                // bundle flattens differently across Xcode/CLI builds.
+                let url = Bundle.module.url(
+                    forResource: "MenuBarIcon",
+                    withExtension: ext,
+                    subdirectory: "Resources/icons"
+                ) ?? Bundle.module.url(
+                    forResource: "MenuBarIcon",
+                    withExtension: ext
+                )
+                if let url, let img = NSImage(contentsOf: url) {
+                    img.size = NSSize(width: 18, height: 18)
+                    FileHandle.standardError.write(Data(
+                        "[Icon] menu bar icon loaded from \(url.path)\n".utf8
+                    ))
+                    return img
+                }
+            }
+            FileHandle.standardError.write(Data(
+                "[Icon] no MenuBarIcon.{svg,pdf,png} found — falling back to SF Symbol photo.stack\n".utf8
+            ))
+            return NSImage(
+                systemSymbolName: "photo.stack",
+                accessibilityDescription: "RefVault"
+            )
+        }()
+        menuIcon?.isTemplate = true
+        item.button?.image = menuIcon
         item.button?.action = #selector(toggleIsland)
         item.button?.target = self
         statusItem = item
@@ -120,21 +198,22 @@ struct RefVaultApp: App {
                 .onAppear {
                     startWatching()
                     if searchModel.parser == nil {
-                        // Search-query parsing is short-prompt JSON-mode
-                        // work; e4b is fast (~1-2s vs 5-8s on the 26b
-                        // primary) and accurate enough when the library
-                        // vocabulary is fed in via vocabularyProvider.
+                        // 26b only — no model swaps. Pinning a smaller
+                        // model alongside (e2b/e4b) caused two problems:
+                        // memory contention on the 24GB Mac (swap-thrash
+                        // when both want keep_alive=-1) and cross-model
+                        // weight juggling between every ingest and search
+                        // call. Both go away when search rides the same
+                        // warm 26b that ingestion uses.
                         searchModel.parser = SearchParser(
-                            client: coordinator.agent.client.withModel("gemma4:e4b"),
+                            client: coordinator.agent.client,
                             vocabularyProvider: { [weak store] in
                                 store?.vocabulary
                             }
                         )
                     }
-                    // Pre-warm Ollama so the user's first ingest / regen
-                    // doesn't pay the ~55s cold-load on the relevance call.
-                    // Fire-and-forget — if Ollama is down, the next real
-                    // call will surface the error.
+                    // Pre-warm 26b so the user's first ingest / regen /
+                    // search doesn't pay the ~55s cold-load.
                     Task.detached { [client = coordinator.agent.client] in
                         try? await client.preload()
                     }

@@ -26,9 +26,14 @@ struct SearchParser {
         let template = try PromptStore.load("search")
         let vocab = await currentVocabulary()
         let prompt = buildPrompt(template: template, vocabulary: vocab, query: trimmed)
+        // SearchFilter JSON is small (~12 keys, mostly short strings).
+        // Capping num_predict at 256 makes the model stop emitting tokens
+        // as soon as the closing brace appears — keeps the call sub-second
+        // when the 26b is already warm in Ollama.
         let (decoded, _) = try await client.generateTextJSON(
             prompt: prompt,
-            as: SearchFilter.self
+            as: SearchFilter.self,
+            numPredict: 256
         )
         return decoded
     }

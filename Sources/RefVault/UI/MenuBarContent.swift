@@ -26,9 +26,20 @@ struct MenuBarContent: View {
     }
 
     private var filteredRecords: [ScreenshotRecord] {
+        // When Gemma parsed the query, substring search runs on freeText
+        // (the leftover Gemma didn't structure), not the raw committed
+        // query — otherwise "i want something clean" would AND a "clean"
+        // chip with a substring search for the literal phrase, finding
+        // zero records.
+        let substring: String = {
+            if let f = searchModel.parsedFilter, !f.isEmpty {
+                return f.freeText?.trimmingCharacters(in: .whitespaces) ?? ""
+            }
+            return searchModel.committedQuery
+        }()
         let base: [ScreenshotRecord]
-        if let f = searchModel.parsedFilter, !f.isEmpty {
-            base = store.search(filter: f)
+        if !substring.isEmpty {
+            base = store.search(substring)
         } else {
             base = store.records
         }
@@ -38,13 +49,8 @@ struct MenuBarContent: View {
             tagFiltered = base
         } else {
             tagFiltered = base.filter { record in
-                let recordTags = Set(record.metadata?.tags ?? [])
-                let recordColors: Set<String> = Set(
-                    (record.palette?.all ?? []).flatMap { ColorNamer.families(for: $0) }
-                )
-                return selected.allSatisfy { sel in
-                    recordTags.contains(sel) || recordColors.contains(sel)
-                }
+                let haystack = chipHaystack(for: record)
+                return selected.allSatisfy { haystack.contains($0.lowercased()) }
             }
         }
         return searchModel.sorted(tagFiltered)
@@ -87,11 +93,29 @@ struct MenuBarContent: View {
                 Spacer(minLength: 0)
             }
             .padding(.horizontal, 24)
-            .padding(.top, 6)
+            // Top edge of the panel sits flush against the screen edge /
+            // notch — 6pt was clipping the controls on the wing strip.
+            // 12pt gives the row breathing room without making it feel
+            // detached from the top.
+            .padding(.top, 12)
             .padding(.bottom, 14)
             .opacity(revealed ? 1 : 0)
             .animation(.easeOut(duration: 0.25), value: revealed)
         }
+        // Clip everything inside the panel to the same uneven-rounded
+        // shape used as the background. Without this, content at the
+        // edges (especially the bottom result rail's cards) overflows
+        // past the rounded corners with sharp edges instead of following
+        // the curve.
+        .clipShape(
+            UnevenRoundedRectangle(
+                topLeadingRadius: 0,
+                bottomLeadingRadius: 28,
+                bottomTrailingRadius: 28,
+                topTrailingRadius: 0,
+                style: .continuous
+            )
+        )
         .preferredColorScheme(.dark)
         .onAppear {
             revealed = false
@@ -272,9 +296,19 @@ struct MenuBarContent: View {
                 }
 
             if searchModel.isParsing {
-                ProgressView()
-                    .controlSize(.small)
-                    .tint(.white.opacity(0.7))
+                HStack(spacing: 6) {
+                    ProgressView()
+                        .controlSize(.small)
+                        .tint(.white.opacity(0.7))
+                    if let started = searchModel.parseStartedAt {
+                        TimelineView(.periodic(from: .now, by: 0.5)) { ctx in
+                            let secs = max(0, Int(ctx.date.timeIntervalSince(started)))
+                            Text("+\(secs)s")
+                                .font(.system(size: 10, weight: .medium).monospacedDigit())
+                                .foregroundColor(.white.opacity(0.55))
+                        }
+                    }
+                }
             } else if !searchModel.query.isEmpty {
                 Text("\(filteredRecords.count) matches")
                     .font(.system(size: 10, weight: .medium, design: .monospaced))
@@ -289,13 +323,23 @@ struct MenuBarContent: View {
                 .help("Clear search")
             }
 
-            Text("⌘K")
-                .font(.system(size: 9, design: .monospaced))
-                .foregroundColor(.white.opacity(0.65))
-                .padding(.horizontal, 5)
-                .padding(.vertical, 1.5)
-                .background(RoundedRectangle(cornerRadius: 4)
-                    .fill(Color.white.opacity(0.08)))
+            // Submit button — same effect as pressing Return inside the
+            // text field. Visible whenever there's a non-empty query.
+            // Replaces the old "⌘K" hint, which hinted at a shortcut we
+            // weren't actually wiring up.
+            if !searchModel.query.isEmpty {
+                Button(action: { searchModel.submit() }) {
+                    Image(systemName: "return")
+                        .font(.system(size: 10, weight: .semibold))
+                        .foregroundColor(.white.opacity(0.85))
+                        .padding(.horizontal, 6)
+                        .padding(.vertical, 2)
+                        .background(RoundedRectangle(cornerRadius: 4)
+                            .fill(Color.white.opacity(0.10)))
+                }
+                .buttonStyle(.plain)
+                .help("Run search")
+            }
         }
         .frame(height: 32)
         .padding(.horizontal, 14)
@@ -385,31 +429,14 @@ struct MenuBarContent: View {
             }
             .padding(.trailing, 4)
 
-            // Selected chips from the tag/color filter row promote up
-            // into the FILTER row so all active filters live in one
-            // place. AI-parsed chips render after.
+            // Selected chips (manual + AI-promoted) all live in
+            // selectedTags now, so this is the single source of chip
+            // truth. The labelled "MOOD x" / "STYLE y" chips that used
+            // to render from activeChips were removed — they were
+            // duplicating the same value as a parallel chip style.
             ForEach(Array(searchModel.selectedTags).sorted(), id: \.self) { tag in
                 selectedTagChip(tag)
             }
-            ForEach(activeChips) { chip in
-                filterChipView(chip)
-            }
-
-            HStack(spacing: 4) {
-                Image(systemName: "plus")
-                    .font(.system(size: 9, weight: .bold))
-                    .foregroundColor(.white.opacity(0.55))
-                Text("filter")
-                    .font(.system(size: 11))
-                    .foregroundColor(.white.opacity(0.55))
-            }
-            .padding(.horizontal, 10)
-            .padding(.vertical, 4)
-            .overlay(
-                Capsule()
-                    .strokeBorder(style: StrokeStyle(lineWidth: 0.5, dash: [3]))
-                    .foregroundColor(.white.opacity(0.22))
-            )
 
             Spacer()
 
@@ -482,10 +509,15 @@ struct MenuBarContent: View {
 
     @ViewBuilder
     private var tagsRow: some View {
-        let allTags = store.vocabulary.tags
-        let available = allTags.filter { !searchModel.selectedTags.contains($0) }
+        // Unified attribute pool — same as LibraryView's chipVocabulary
+        // so picking any chip filters because chipHaystack already covers
+        // the full set of fields (style/mood/layout/typography/tags/...).
+        let available = store.chipVocabulary.filter {
+            !searchModel.selectedTags.contains($0)
+        }
         HStack(spacing: 6) {
             colorMenu
+            typographyMenu
             // Available-only here. Selected tags promoted up into the
             // FILTER row so all active filters cluster together.
             ScrollView(.horizontal, showsIndicators: false) {
@@ -561,6 +593,68 @@ struct MenuBarContent: View {
         .menuStyle(.borderlessButton)
         .menuIndicator(.hidden)
         .fixedSize()
+    }
+
+    /// Slot-aware typography dropdown — mirrors LibraryView's
+    /// TypographyPickerMenu but uses the popover's dark chip styling.
+    /// Each pick adds a token like "heading: serif" so chip filtering
+    /// targets the right slot.
+    private var typographyMenu: some View {
+        let vocab = store.typographyVocabulary
+        let generics = ["serif", "sans-serif", "mono"]
+        return Menu {
+            Section("Headings") {
+                ForEach(typographyMenuItems(from: vocab.headings, generics: generics), id: \.self) { f in
+                    typographyButton(slot: "heading", value: f)
+                }
+            }
+            Section("Bodies") {
+                ForEach(typographyMenuItems(from: vocab.bodies, generics: generics), id: \.self) { f in
+                    typographyButton(slot: "body", value: f)
+                }
+            }
+            Section("Others") {
+                ForEach(typographyMenuItems(from: vocab.others, generics: generics), id: \.self) { f in
+                    typographyButton(slot: "other", value: f)
+                }
+            }
+        } label: {
+            HStack(spacing: 5) {
+                Image(systemName: "textformat")
+                    .font(.system(size: 10, weight: .medium))
+                    .foregroundColor(.white.opacity(0.6))
+                Text("type")
+                    .font(.system(size: 11, weight: .medium))
+                    .foregroundColor(.white.opacity(0.78))
+                Image(systemName: "chevron.down")
+                    .font(.system(size: 7, weight: .semibold))
+                    .foregroundColor(.white.opacity(0.6))
+            }
+            .padding(.leading, 9)
+            .padding(.trailing, 8)
+            .padding(.vertical, 4)
+            .background(Capsule().fill(Color.white.opacity(0.06)))
+            .overlay(Capsule().stroke(Color.white.opacity(0.12), lineWidth: 0.5))
+        }
+        .menuStyle(.borderlessButton)
+        .menuIndicator(.hidden)
+        .fixedSize()
+    }
+
+    private func typographyMenuItems(from libFonts: [String], generics: [String]) -> [String] {
+        let extras = libFonts.filter { !generics.contains($0.lowercased()) }
+        return generics + extras
+    }
+
+    @ViewBuilder
+    private func typographyButton(slot: String, value: String) -> some View {
+        let token = "\(slot): \(value.lowercased())"
+        let isSel = searchModel.selectedTags.contains(token)
+        Button {
+            searchModel.toggleTag(token)
+        } label: {
+            Text(value + (isSel ? "  ✓" : ""))
+        }
     }
 
     private func swatch(for family: String) -> Color {
@@ -693,11 +787,18 @@ struct MenuBarContent: View {
     private var resultRail: some View {
         ScrollView(.horizontal, showsIndicators: false) {
             HStack(spacing: 12) {
-                ForEach(filteredRecords) { rec in
-                    resultCard(rec)
-                }
-                if filteredRecords.isEmpty {
-                    emptyState
+                if searchModel.isParsing {
+                    // Searching state takes the full rail width — replaces
+                    // both the cards and the "no references" copy that
+                    // were flashing in mid-search before.
+                    searchingState
+                } else {
+                    ForEach(filteredRecords) { rec in
+                        resultCard(rec)
+                    }
+                    if filteredRecords.isEmpty {
+                        emptyState
+                    }
                 }
             }
             .padding(.horizontal, 1)
@@ -715,31 +816,26 @@ struct MenuBarContent: View {
 
     @ViewBuilder
     private func resultCard(_ rec: ScreenshotRecord) -> some View {
+        // Image area is in its own struct so it can hold @State for the
+        // cached NSImage. Keeping NSImage(contentsOf:) inline meant every
+        // searchModel publish (typing in the popover's search field)
+        // re-read every visible card's screenshot from disk.
         VStack(spacing: 8) {
-            ZStack {
-                Color.white.opacity(0.04)
-                if let url = store.storedImageURL(for: rec),
-                   let img = NSImage(contentsOf: url) {
-                    Image(nsImage: img)
-                        .resizable()
-                        .aspectRatio(contentMode: .fill)
-                } else {
-                    Image(systemName: "photo")
-                        .foregroundColor(.white.opacity(0.3))
-                }
-            }
+            ResultCardImage(
+                url: store.storedImageURL(for: rec),
+                recordId: rec.id
+            )
             .frame(width: 192, height: 124)
             .clipShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
             .overlay(RoundedRectangle(cornerRadius: 12, style: .continuous)
                 .stroke(Color.white.opacity(0.08), lineWidth: 0.5))
             .onTapGesture { openMainWindow() }
             .help(cardLabel(for: rec))
-            // Same drag affordance as the main library — drop the file
-            // into any other app. Single tap still opens the main window.
             .onDrag {
                 if let url = store.storedImageURL(for: rec),
                    let provider = NSItemProvider(contentsOf: url) {
                     provider.suggestedName = url.lastPathComponent
+                    tagAsInternalDrag(provider)
                     return provider
                 }
                 return NSItemProvider()
@@ -781,6 +877,46 @@ struct MenuBarContent: View {
                 }
             }
         }
+    }
+
+    /// In-flight search state for the popover's horizontal rail. Mirrors
+    /// the library's SearchingState but sized for the rail's 124pt cell.
+    private var searchingState: some View {
+        HStack(spacing: 12) {
+            // Same spoked spinner as the search field, just larger —
+            // replaces an earlier hand-rolled rotating magnifying-glass
+            // animation that didn't read as "busy."
+            ProgressView()
+                .controlSize(.large)
+                .scaleEffect(1.2)
+                .tint(.white.opacity(0.7))
+            VStack(alignment: .leading, spacing: 2) {
+                if let started = searchModel.parseStartedAt {
+                    TimelineView(.periodic(from: .now, by: 0.5)) { ctx in
+                        let secs = max(0, Int(ctx.date.timeIntervalSince(started)))
+                        Text("Searching… +\(secs)s")
+                            .font(.system(size: 13, weight: .semibold).monospacedDigit())
+                            .foregroundColor(.white)
+                    }
+                } else {
+                    Text("Searching…")
+                        .font(.system(size: 13, weight: .semibold))
+                        .foregroundColor(.white)
+                }
+                Text("Looking for “\(searchModel.query)”")
+                    .font(.system(size: 11))
+                    .foregroundColor(.white.opacity(0.55))
+                    .lineLimit(1)
+                    .truncationMode(.tail)
+            }
+            Spacer()
+        }
+        .padding(16)
+        .frame(height: 124)
+        .background(RoundedRectangle(cornerRadius: 12)
+            .fill(Color.white.opacity(0.04)))
+        .overlay(RoundedRectangle(cornerRadius: 12)
+            .stroke(Color.white.opacity(0.10), lineWidth: 0.5))
     }
 
     private var emptyState: some View {
@@ -844,6 +980,39 @@ private extension Color {
         case "vibrant":                        return Color(red: 1.0, green: 0.22, blue: 0.37)
         case "pastel":                         return Color(red: 0.92, green: 0.86, blue: 0.92)
         default: return nil
+        }
+    }
+}
+
+/// Image area for a popover result card. Owns @State so the loaded
+/// NSImage survives parent re-renders — typing in the popover's search
+/// field used to re-read every visible card's screenshot from disk on
+/// every keystroke, which felt sluggish.
+private struct ResultCardImage: View {
+    let url: URL?
+    let recordId: UUID
+    @State private var cachedImage: NSImage?
+
+    var body: some View {
+        ZStack {
+            Color.white.opacity(0.04)
+            if let img = cachedImage {
+                Image(nsImage: img)
+                    .resizable()
+                    .aspectRatio(contentMode: .fill)
+            } else {
+                Image(systemName: "photo")
+                    .foregroundColor(.white.opacity(0.3))
+            }
+        }
+        .task(id: recordId) {
+            guard cachedImage == nil, let url else { return }
+            let data = await Task.detached(priority: .userInitiated) {
+                try? Data(contentsOf: url)
+            }.value
+            if !Task.isCancelled, let data {
+                cachedImage = NSImage(data: data)
+            }
         }
     }
 }

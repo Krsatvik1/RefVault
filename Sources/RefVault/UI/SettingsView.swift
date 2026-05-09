@@ -43,14 +43,11 @@ struct SettingsView: View {
                 }
 
                 section("Primary model") {
-                    HStack {
-                        Picker("", selection: $coordinator.primaryModel) {
-                            ForEach(availableModels, id: \.self) { Text($0).tag($0) }
-                        }
-                        .labelsHidden()
-                        .frame(maxWidth: 280)
-                        Spacer()
+                    Picker("", selection: $coordinator.primaryModel) {
+                        ForEach(availableModels, id: \.self) { Text($0).tag($0) }
                     }
+                    .labelsHidden()
+                    .fixedSize()
                     Text("Used for auto-ingest and the Detail view's Regenerate button. The Debug tab can pick a different model per slot.")
                         .font(.caption)
                         .foregroundColor(.secondary)
@@ -61,7 +58,7 @@ struct SettingsView: View {
                         VStack(alignment: .leading, spacing: 1) {
                             Text("Granular metadata")
                                 .font(.callout.weight(.medium))
-                            Text("Split metadata into 5 per-field calls (style, typography, layout, mood, tags). Slower but materially better with smaller models like gemma4:e4b.")
+                            Text("Split metadata into 5 per-field calls (style, typography, layout, mood, tags). Slower but produces sharper per-field outputs.")
                                 .font(.caption)
                                 .foregroundColor(.secondary)
                         }
@@ -84,7 +81,7 @@ struct SettingsView: View {
                                 .foregroundColor(.secondary)
                         }
                     }
-                    Text("These settings apply to auto-ingest, Regenerate, and the default of new Debug slots — for both gemma4:26b and gemma4:e4b.")
+                    Text("These settings apply to auto-ingest and Regenerate.")
                         .font(.caption)
                         .foregroundColor(.secondary)
                         .padding(.top, 4)

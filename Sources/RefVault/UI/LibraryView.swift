@@ -1,5 +1,18 @@
 import SwiftUI
 import AppKit
+import UniformTypeIdentifiers
+
+/// Private UTI tagged onto every `.onDrag` initiated from inside RefVault
+/// (LibraryCard + popover resultCard). The drop target on LibraryView
+/// rejects any drop whose providers carry this type, so picking up a card
+/// and pausing the cursor over the library doesn't flash the import
+/// overlay. `.ownProcess` visibility means other apps never see this UTI
+/// — Finder/Slack/Figma still get the regular `.fileURL` representation.
+extension UTType {
+    static let refVaultInternalCardDrag = UTType(
+        exportedAs: "com.refvault.internalCardDrag"
+    )
+}
 
 struct LibraryView: View {
     @EnvironmentObject var store: LibraryStore
@@ -8,6 +21,7 @@ struct LibraryView: View {
     @EnvironmentObject var searchModel: SearchModel
 
     @State private var selectedRecord: ScreenshotRecord?
+    @State private var isImportTargeted = false
 
     private let columns = [GridItem(.adaptive(minimum: 220, maximum: 320), spacing: 16)]
 
@@ -23,6 +37,20 @@ struct LibraryView: View {
             Divider()
             content
         }
+        .onDrop(
+            of: [.fileURL],
+            delegate: LibraryImportDropDelegate(
+                isTargeted: $isImportTargeted,
+                coordinator: coordinator
+            )
+        )
+        .overlay {
+            if isImportTargeted {
+                ImportDropOverlay()
+                    .transition(.opacity)
+            }
+        }
+        .animation(.easeInOut(duration: 0.12), value: isImportTargeted)
         .sheet(item: $selectedRecord) { rec in
             let dims = sheetDimensions(for: rec)
             DetailView(record: rec)
@@ -75,17 +103,6 @@ struct LibraryView: View {
                     .font(.title3)
                     .foregroundColor(.secondary)
                 Spacer()
-                Button {
-                    watcher.scanNow()
-                } label: {
-                    Label("Scan now", systemImage: "arrow.clockwise")
-                }
-                Button {
-                    watcher.emitExistingFiles()
-                } label: {
-                    Label("Index existing", systemImage: "tray.and.arrow.down")
-                }
-                .help("Send every existing screenshot in the watched folders through Gemma. Useful on first launch.")
             }
 
             // Custom search field — toolbar-embedded TextField with
@@ -105,44 +122,44 @@ struct LibraryView: View {
                 )
             }
 
-            // Available tags from library vocabulary, with selected ones
-            // filtered out (they live in the selected row above).
-            // The color picker sits inline with the tags row so the user
-            // can add a color filter alongside tag filters; chosen colors
-            // also land in selectedTags and use the same chip UI above.
+            // Unified chip vocabulary — every searchable attribute across
+            // the library (style, mood, layout, tags, typography, surface,
+            // device, orientation) ranked by frequency. Picking any chip
+            // narrows the grid via chipHaystack which matches the same
+            // attributes. Selected chips are filtered out (they live in
+            // the selected row above). Color stays in its own dropdown
+            // since color families are derived from palettes, not metadata.
             HStack(spacing: 8) {
                 ColorPickerMenu(
                     selected: searchModel.selectedTags,
                     onPick: { searchModel.toggleTag($0) }
                 )
-                if !store.vocabulary.tags.isEmpty {
-                    let available = store.vocabulary.tags.filter {
-                        !searchModel.selectedTags.contains($0)
-                    }
-                    if !available.isEmpty {
-                        TagFilterRow(
-                            tags: available,
-                            selected: [],
-                            onToggle: { searchModel.toggleTag($0) }
-                        )
-                    }
+                TypographyPickerMenu(
+                    vocab: store.typographyVocabulary,
+                    selected: searchModel.selectedTags,
+                    onPick: { searchModel.toggleTag($0) }
+                )
+                let available = store.chipVocabulary.filter {
+                    !searchModel.selectedTags.contains($0)
+                }
+                if !available.isEmpty {
+                    TagFilterRow(
+                        tags: available,
+                        selected: [],
+                        onToggle: { searchModel.toggleTag($0) }
+                    )
                 }
             }
 
-            if !query.trimmingCharacters(in: .whitespaces).isEmpty {
-                if let filter = parsedFilter, parsedFilterFor == query, !filter.isEmpty {
-                    FilterChips(filter: filter, isParsing: false)
-                } else {
-                    FilterChips(
-                        filter: SearchFilter(freeText: query),
-                        isParsing: isParsing
-                    )
-                }
-                if let err = parseError {
-                    Text("Couldn't parse query — falling back to keyword match. (\(err))")
-                        .font(.caption2)
-                        .foregroundColor(.secondary)
-                }
+            // No parsed-filter chip row. After Gemma parses, every
+            // categorical value (mood/style/tags/colors/etc) is promoted
+            // into searchModel.selectedTags, so the user sees a single
+            // unified row of blue chips above instead of two parallel
+            // chip styles for the same thing.
+            if let err = parseError, !query.trimmingCharacters(in: .whitespaces).isEmpty {
+                Text("Couldn't parse query — falling back to keyword match. (\(err))")
+                    .font(.caption2)
+                    .foregroundColor(.secondary)
             }
         }
         .padding(16)
@@ -151,7 +168,12 @@ struct LibraryView: View {
     @ViewBuilder
     private var content: some View {
         let results = currentResults
-        if store.records.isEmpty {
+        if searchModel.isParsing {
+            // Live searching state — big spinner + the query Gemma is
+            // currently working on. Replaces the "No matches" empty state
+            // that was flashing while the parse was still in flight.
+            SearchingState(query: query, startedAt: searchModel.parseStartedAt)
+        } else if store.records.isEmpty {
             EmptyState(
                 title: "No references yet",
                 subtitle: watcher.isActive
@@ -230,34 +252,76 @@ struct LibraryView: View {
     }
 }
 
+/// All tokens a single record can match against — every selected chip
+/// must hit one of these. Lowercased so chip-side normalization in
+/// SearchModel.launchParse matches without case wobble. Module-internal
+/// so MenuBarContent's popover filter can use the same haystack.
+func chipHaystack(for record: ScreenshotRecord) -> Set<String> {
+    var set = Set<String>()
+    if let m = record.metadata {
+        set.formUnion(m.tags.map { $0.lowercased() })
+        set.insert(m.style.lowercased())
+        set.insert(m.mood.lowercased())
+        set.insert(m.layout.lowercased())
+        // Slot-qualified typography tokens so chips like "heading: serif"
+        // only match records that have serif specifically in headings.
+        set.formUnion(m.typography.headings.map { "heading: \($0.lowercased())" })
+        set.formUnion(m.typography.bodies.map { "body: \($0.lowercased())" })
+        set.formUnion(m.typography.others.map { "other: \($0.lowercased())" })
+    }
+    if let palette = record.palette {
+        let families = palette.all.flatMap { ColorNamer.families(for: $0) }
+        set.formUnion(families.map { $0.lowercased() })
+    }
+    set.insert(record.relevance.surface.lowercased())
+    set.insert(record.relevance.device.lowercased())
+    set.insert(record.orientation.lowercased())
+    return set
+}
+
 extension LibraryView {
-    /// Records to render. If Gemma already parsed the current query, use the
-    /// structured filter; otherwise fall back to substring search so the grid
-    /// reacts immediately to typing while Gemma is in flight.
+    /// Records to render. Driven by `searchModel.committedQuery`, NOT the
+    /// live-typing `query` — that means the grid only re-filters after the
+    /// debounce window expires (or the user hits Enter). Without this the
+    /// substring fallback fired on every keystroke and the grid felt jumpy.
+    /// Gemma-parsed values are no longer used as a separate filter path —
+    /// they're promoted into selectedTags after each parse, so the chip
+    /// AND-match below picks them up uniformly with manual chips.
+    ///
+    /// Substring source: when Gemma's parse succeeded, use `freeText` (the
+    /// part of the query Gemma couldn't slot into a structured field) —
+    /// NOT the raw committedQuery. Otherwise a query like "i want
+    /// something clean" gets the "clean" chip promoted AND tries to
+    /// substring-match the literal phrase "i want something clean" in
+    /// every record's haystack, which finds nothing — the intersection
+    /// of the chip filter and a guaranteed-empty substring is zero.
     fileprivate var currentResults: [ScreenshotRecord] {
+        let substring: String = {
+            if let f = searchModel.parsedFilter, !f.isEmpty {
+                return f.freeText?.trimmingCharacters(in: .whitespaces) ?? ""
+            }
+            return searchModel.committedQuery
+        }()
         let base: [ScreenshotRecord]
-        if let filter = parsedFilter, parsedFilterFor == query, !filter.isEmpty {
-            base = store.search(filter: filter)
+        if !substring.isEmpty {
+            base = store.search(substring)
         } else {
-            base = store.search(query)
+            base = store.records
         }
         let selected = searchModel.selectedTags
         let filtered: [ScreenshotRecord]
         if selected.isEmpty {
             filtered = base
         } else {
-            // Selected tokens AND-match either against the record's tags
-            // OR against any color family in its palette. This lets a
-            // color family ("brown") and a tag ("editorial") coexist as
-            // selected chips and the record satisfies both constraints.
+            // Each selected chip AND-matches anywhere in the record's
+            // metadata: tags, palette color families, style, mood, layout,
+            // surface, device. This lets Gemma-promoted chips ("edgy" for
+            // mood, "minimal" for style) coexist with manual tag chips
+            // and color chips in one unified row, and a record satisfies
+            // a chip if it matches on any field.
             filtered = base.filter { record in
-                let recordTags = Set(record.metadata?.tags ?? [])
-                let recordColors: Set<String> = Set(
-                    (record.palette?.all ?? []).flatMap { ColorNamer.families(for: $0) }
-                )
-                return selected.allSatisfy { sel in
-                    recordTags.contains(sel) || recordColors.contains(sel)
-                }
+                let haystack = chipHaystack(for: record)
+                return selected.allSatisfy { haystack.contains($0.lowercased()) }
             }
         }
         return searchModel.sorted(filtered)
@@ -284,7 +348,21 @@ private struct CustomSearchField: View {
                 }
                 .onSubmit { searchModel.submit() }
             if searchModel.isParsing {
-                ProgressView().controlSize(.small)
+                HStack(spacing: 6) {
+                    ProgressView().controlSize(.small)
+                    if let started = searchModel.parseStartedAt {
+                        // Live "+Ns" so the user knows the parse is still
+                        // running (and how long it's been). TimelineView
+                        // ticks the label only — doesn't re-render the
+                        // text field or its binding.
+                        TimelineView(.periodic(from: .now, by: 0.5)) { ctx in
+                            let secs = max(0, Int(ctx.date.timeIntervalSince(started)))
+                            Text("+\(secs)s")
+                                .font(.system(size: 11, weight: .medium).monospacedDigit())
+                                .foregroundColor(.secondary)
+                        }
+                    }
+                }
             } else if !searchModel.query.isEmpty {
                 Button {
                     searchModel.clear()
@@ -294,6 +372,27 @@ private struct CustomSearchField: View {
                         .foregroundColor(.secondary)
                 }
                 .buttonStyle(.plain)
+            }
+            // Submit button — same effect as pressing Return. Visible
+            // whenever there's a non-empty query, regardless of parsing
+            // state, so the user can re-fire the parse if a previous one
+            // failed.
+            if !searchModel.query.isEmpty {
+                Button {
+                    searchModel.submit()
+                } label: {
+                    Image(systemName: "return")
+                        .font(.system(size: 10, weight: .semibold))
+                        .foregroundColor(.secondary)
+                        .padding(.horizontal, 6)
+                        .padding(.vertical, 2)
+                        .background(
+                            RoundedRectangle(cornerRadius: 4, style: .continuous)
+                                .fill(Color.secondary.opacity(0.12))
+                        )
+                }
+                .buttonStyle(.plain)
+                .help("Run search")
             }
         }
         .padding(.horizontal, 12)
@@ -380,6 +479,88 @@ private struct ColorPickerMenu: View {
         case "brown":  return Color(red: 0.55, green: 0.36, blue: 0.20)
         case "beige":  return Color(red: 0.92, green: 0.86, blue: 0.72)
         default:        return .gray
+        }
+    }
+}
+
+// MARK: Typography picker
+
+/// Dropdown that mirrors ColorPickerMenu but shows the library's actual
+/// font tokens grouped by their slot in each record (Headings / Bodies /
+/// Others). Picking a font adds it to selectedTags; chipHaystack already
+/// matches typography fields so the grid filters automatically.
+private struct TypographyPickerMenu: View {
+    let vocab: LibraryStore.TypographyVocabulary
+    let selected: Set<String>
+    let onPick: (String) -> Void
+
+    private static let genericClasses = ["serif", "sans-serif", "mono"]
+
+    var body: some View {
+        Menu {
+            // Each section is slot-qualified — picking "serif" under
+            // Headings adds "heading: serif" to selectedTags, which
+            // matches only records whose typography.headings field
+            // contains "serif". Generic classes (serif/sans-serif/mono)
+            // are always offered alongside the library's actual fonts.
+            Section("Headings") {
+                ForEach(menuItems(for: vocab.headings), id: \.self) { f in
+                    pickerButton(slot: "heading", value: f)
+                }
+            }
+            Section("Bodies") {
+                ForEach(menuItems(for: vocab.bodies), id: \.self) { f in
+                    pickerButton(slot: "body", value: f)
+                }
+            }
+            Section("Others") {
+                ForEach(menuItems(for: vocab.others), id: \.self) { f in
+                    pickerButton(slot: "other", value: f)
+                }
+            }
+        } label: {
+            HStack(spacing: 6) {
+                Image(systemName: "textformat")
+                    .font(.system(size: 11, weight: .medium))
+                    .foregroundColor(.secondary)
+                Text("Typography")
+                    .font(.caption.weight(.medium))
+                    .foregroundColor(.primary)
+                Image(systemName: "chevron.down")
+                    .font(.system(size: 8, weight: .semibold))
+                    .foregroundColor(.secondary)
+            }
+            .padding(.horizontal, 10)
+            .padding(.vertical, 5)
+            .background(Capsule().fill(Color.secondary.opacity(0.12)))
+            .overlay(Capsule().stroke(Color.secondary.opacity(0.20), lineWidth: 1))
+        }
+        .menuStyle(.borderlessButton)
+        .menuIndicator(.hidden)
+        .fixedSize()
+    }
+
+    /// Generic classes always at the top, then library-specific fonts
+    /// (deduped against the generics so "sans-serif" doesn't appear twice
+    /// when Gemma already extracted it as a heading).
+    private func menuItems(for libFonts: [String]) -> [String] {
+        let lowerLib = Set(libFonts.map { $0.lowercased() })
+        let extras = libFonts.filter { !Self.genericClasses.contains($0.lowercased()) }
+        var out = Self.genericClasses
+        out.append(contentsOf: extras)
+        // (lowerLib used to silence warnings if extras is empty)
+        _ = lowerLib
+        return out
+    }
+
+    @ViewBuilder
+    private func pickerButton(slot: String, value: String) -> some View {
+        let token = "\(slot): \(value.lowercased())"
+        let isSel = selected.contains(token)
+        Button {
+            onPick(token)
+        } label: {
+            Text(value + (isSel ? "  ✓" : ""))
         }
     }
 }
@@ -516,6 +697,14 @@ struct LibraryCard: View {
     @EnvironmentObject var store: LibraryStore
     @EnvironmentObject var coordinator: IngestionCoordinator
 
+    /// Cached loaded image. Without this, every body re-evaluation
+    /// (including the one that fires on every keystroke in the search
+    /// field, because the entire view tree observes searchModel) re-reads
+    /// the screenshot from disk via NSImage(contentsOf:). With ~14 visible
+    /// cards × multi-MB PNGs that turns into hundreds of milliseconds of
+    /// disk I/O per keystroke and the field feels sluggish.
+    @State private var cachedImage: NSImage?
+
     private var isRegenerating: Bool {
         coordinator.regeneratingIds.contains(record.id)
     }
@@ -533,8 +722,7 @@ struct LibraryCard: View {
             Color.secondary.opacity(0.1)
                 .aspectRatio(16.0 / 10.0, contentMode: .fit)
                 .overlay {
-                    if let url = store.storedImageURL(for: record),
-                       let image = NSImage(contentsOf: url) {
+                    if let image = cachedImage {
                         Image(nsImage: image)
                             .resizable()
                             .aspectRatio(contentMode: .fill)
@@ -545,6 +733,21 @@ struct LibraryCard: View {
                     }
                 }
                 .clipped()
+                .task(id: record.id) {
+                    // Off-main disk read so it doesn't block the typing
+                    // path. Only fires once per card lifecycle (re-runs
+                    // only when record.id changes). Loads Data off-main
+                    // then constructs NSImage on the main actor — NSImage
+                    // isn't Sendable on macOS 13, Data is.
+                    guard cachedImage == nil,
+                          let url = store.storedImageURL(for: record) else { return }
+                    let data = await Task.detached(priority: .userInitiated) {
+                        try? Data(contentsOf: url)
+                    }.value
+                    if !Task.isCancelled, let data {
+                        cachedImage = NSImage(data: data)
+                    }
+                }
 
             VStack(alignment: .leading, spacing: 8) {
                 HStack(spacing: 4) {
@@ -619,6 +822,7 @@ struct LibraryCard: View {
             if let url = store.storedImageURL(for: record),
                let provider = NSItemProvider(contentsOf: url) {
                 provider.suggestedName = url.lastPathComponent
+                tagAsInternalDrag(provider)
                 return provider
             }
             return NSItemProvider()
@@ -843,6 +1047,49 @@ struct EmptyState: View {
     }
 }
 
+/// Shown while Gemma is parsing the query. Replaces the "No matches"
+/// empty state that was flashing during the wait — that copy was
+/// misleading because we hadn't actually finished searching yet.
+struct SearchingState: View {
+    let query: String
+    let startedAt: Date?
+
+    var body: some View {
+        VStack(spacing: 16) {
+            Spacer()
+            // Standard spoked progress indicator (NSProgressIndicator
+            // under the hood), scaled up to read from across the room.
+            // Replaced an earlier hand-rolled rotating magnifying-glass
+            // animation that read more like a UI bug than a spinner.
+            ProgressView()
+                .controlSize(.large)
+                .scaleEffect(1.6)
+                .frame(height: 56)
+            VStack(spacing: 6) {
+                if let started = startedAt {
+                    TimelineView(.periodic(from: .now, by: 0.5)) { ctx in
+                        let secs = max(0, Int(ctx.date.timeIntervalSince(started)))
+                        Text("Searching… +\(secs)s")
+                            .font(.headline)
+                            .monospacedDigit()
+                    }
+                } else {
+                    Text("Searching…")
+                        .font(.headline)
+                }
+                Text("Looking for “\(query)”")
+                    .font(.callout)
+                    .foregroundColor(.secondary)
+                    .multilineTextAlignment(.center)
+                    .frame(maxWidth: 420)
+            }
+            Spacer()
+        }
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+        .padding(32)
+    }
+}
+
 extension Color {
     init?(hex: String) {
         var s = hex.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -852,5 +1099,103 @@ extension Color {
         let g = Double((v >> 8) & 0xff) / 255
         let b = Double(v & 0xff) / 255
         self = Color(red: r, green: g, blue: b)
+    }
+}
+
+// MARK: - Import drop
+
+/// Tag an outgoing card drag with our private UTI so the LibraryView's
+/// drop delegate can filter it out (otherwise picking up a card briefly
+/// flashes the import overlay). Uses `.ownProcess` visibility so external
+/// apps never see this type — they only see the regular `.fileURL`
+/// representation already on the provider.
+func tagAsInternalDrag(_ provider: NSItemProvider) {
+    provider.registerDataRepresentation(
+        forTypeIdentifier: UTType.refVaultInternalCardDrag.identifier,
+        visibility: .ownProcess
+    ) { completion in
+        completion(Data(), nil)
+        return nil
+    }
+}
+
+private struct LibraryImportDropDelegate: DropDelegate {
+    @Binding var isTargeted: Bool
+    let coordinator: IngestionCoordinator
+
+    private static let imageExt: Set<String> = [
+        "png", "jpg", "jpeg", "heic", "webp",
+    ]
+
+    func validateDrop(info: DropInfo) -> Bool {
+        // Reject our own card drags so the overlay doesn't flash when the
+        // user picks up a card and pauses over the library.
+        if info.hasItemsConforming(to: [.refVaultInternalCardDrag]) {
+            return false
+        }
+        return info.hasItemsConforming(to: [.fileURL])
+    }
+
+    func dropEntered(info: DropInfo) {
+        guard validateDrop(info: info) else { return }
+        isTargeted = true
+    }
+
+    func dropExited(info: DropInfo) {
+        isTargeted = false
+    }
+
+    func dropUpdated(info: DropInfo) -> DropProposal? {
+        validateDrop(info: info)
+            ? DropProposal(operation: .copy)
+            : DropProposal(operation: .forbidden)
+    }
+
+    func performDrop(info: DropInfo) -> Bool {
+        isTargeted = false
+        guard validateDrop(info: info) else { return false }
+        let providers = info.itemProviders(for: [.fileURL])
+        for provider in providers {
+            _ = provider.loadObject(ofClass: URL.self) { url, _ in
+                guard let url else { return }
+                guard Self.imageExt.contains(url.pathExtension.lowercased()) else {
+                    return
+                }
+                Task { @MainActor in
+                    coordinator.enqueue(url)
+                }
+            }
+        }
+        return true
+    }
+}
+
+private struct ImportDropOverlay: View {
+    var body: some View {
+        ZStack {
+            Color.black.opacity(0.55)
+            VStack(spacing: 12) {
+                Image(systemName: "tray.and.arrow.down.fill")
+                    .font(.system(size: 48, weight: .light))
+                    .foregroundColor(.white.opacity(0.95))
+                Text("Drop image to add")
+                    .font(.system(size: 16, weight: .semibold))
+                    .foregroundColor(.white)
+            }
+            .padding(.horizontal, 36)
+            .padding(.vertical, 28)
+            .background(
+                RoundedRectangle(cornerRadius: 16, style: .continuous)
+                    .fill(Color.white.opacity(0.08))
+            )
+            .overlay(
+                RoundedRectangle(cornerRadius: 16, style: .continuous)
+                    .strokeBorder(
+                        style: StrokeStyle(lineWidth: 1.5, dash: [6, 4])
+                    )
+                    .foregroundColor(.white.opacity(0.55))
+            )
+        }
+        .allowsHitTesting(false)
     }
 }

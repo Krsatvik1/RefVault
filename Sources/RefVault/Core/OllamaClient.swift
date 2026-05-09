@@ -19,18 +19,14 @@ struct OllamaClient {
         self.session = session
     }
 
-    /// Default model used when no override is supplied. `26b` MoE is the
-    /// quality target; `gemma4:e4b` is available as a faster A/B option in
-    /// the debug view.
+    /// Default model used when no override is supplied. 26b MoE is the
+    /// only model the app ships with — earlier we exposed e2b/e4b as
+    /// faster variants but cross-model contention on a 24GB Mac (multiple
+    /// models all wanting keep_alive=-1) made search calls swap-thrash and
+    /// every ingest pay a model-switch penalty. Single model = predictable.
     static let defaultModel = "gemma4:26b"
 
-    /// All gemma4 tags the UI knows about. Surfaced in the debug picker so
-    /// the user can A/B between sizes.
-    static let knownGemmaModels: [String] = [
-        "gemma4:e2b",
-        "gemma4:e4b",
-        "gemma4:26b"
-    ]
+    static let knownGemmaModels: [String] = ["gemma4:26b"]
 
     /// Model used for the URL extraction call. Defaults to nil so the URL
     /// call rides the same active client as everything else (no model
@@ -148,9 +144,14 @@ struct OllamaClient {
     func generateTextJSON<T: Decodable>(
         prompt: String,
         as type: T.Type,
-        temperature: Double = 0.0
+        temperature: Double = 0.0,
+        numPredict: Int? = nil
     ) async throws -> (decoded: T, raw: String) {
-        let raw = try await generateText(prompt: prompt, temperature: temperature)
+        let raw = try await generateText(
+            prompt: prompt,
+            temperature: temperature,
+            numPredict: numPredict
+        )
         return try Self.decodeJSON(raw: raw, as: type)
     }
 
@@ -251,9 +252,14 @@ struct OllamaClient {
 
     /// Text-only generate. Mirrors `generateRaw` but omits the `images`
     /// payload so the prompt is purely textual.
+    ///
+    /// `numPredict` caps output tokens; for short JSON responses (search-
+    /// query parser) capping at ~256 makes the call return as soon as the
+    /// model emits the closing brace instead of letting it ramble.
     func generateText(
         prompt: String,
-        temperature: Double = 0.0
+        temperature: Double = 0.0,
+        numPredict: Int? = nil
     ) async throws -> String {
         struct GenerateRequest: Encodable {
             let model: String
@@ -268,13 +274,15 @@ struct OllamaClient {
             let response: String
         }
 
+        var opts: [String: Double] = ["temperature": temperature]
+        if let n = numPredict { opts["num_predict"] = Double(n) }
         let body = GenerateRequest(
             model: model,
             prompt: prompt,
             stream: false,
             format: "json",
             think: false,
-            options: ["temperature": temperature],
+            options: opts,
             keep_alive: -1
         )
 

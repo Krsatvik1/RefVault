@@ -1,19 +1,17 @@
 import SwiftUI
 
 enum NavSection: String, Hashable, CaseIterable, Identifiable {
-    case library, debug, settings
+    case library, settings
     var id: String { rawValue }
     var title: String {
         switch self {
         case .library: return "Library"
-        case .debug:   return "Debug"
         case .settings: return "Settings"
         }
     }
     var systemImage: String {
         switch self {
         case .library: return "square.grid.2x2"
-        case .debug:   return "ladybug"
         case .settings: return "gear"
         }
     }
@@ -32,10 +30,8 @@ struct MainWindow: View {
         NavigationSplitView {
             List(selection: $selection) {
                 Section("Browse") {
-                    ForEach([NavSection.library, .debug]) { section in
-                        Label(section.title, systemImage: section.systemImage)
-                            .tag(section)
-                    }
+                    Label(NavSection.library.title, systemImage: NavSection.library.systemImage)
+                        .tag(NavSection.library)
                 }
                 Section("App") {
                     Label(NavSection.settings.title, systemImage: NavSection.settings.systemImage)
@@ -50,8 +46,6 @@ struct MainWindow: View {
             switch selection {
             case .library:
                 LibraryView()
-            case .debug:
-                DebugView()
             case .settings:
                 SettingsView()
             }

@@ -9,8 +9,10 @@ these axes:
 - orientation: "landscape" | "portrait" | "square"
 - style: free-form adjective like "minimal", "brutalist", "editorial", "playful"
 - mood:  free-form adjective like "calm", "energetic", "luxurious", "warm"
-- tags:  list of free-form keywords like "pricing", "hero", "serif", "card"
+- tags:  list of free-form keywords like "pricing", "hero", "card"
 - palette: hex color strings (e.g. "#0a0a0a")
+- typography: font family names + classes ("serif", "sans-serif", "mono",
+  "Inter", "Söhne", "Times New Roman", "Geist Mono")
 
 Return ONLY a JSON object with these keys (omit or null any axis the query
 did not constrain):
@@ -24,6 +26,11 @@ did not constrain):
   "tags_all":     [string] | null,   // every tag must appear
   "tags_any":     [string] | null,   // at least one must appear
   "colors":       [string] | null,   // "dark", "warm", "#ff7700"
+  "typography":   {                    // per-slot, since one design can
+    "headings": [string] | null,       // mix serif headings + sans-serif
+    "bodies":   [string] | null,       // body etc.
+    "others":   [string] | null
+  } | null,
   "free_text":    string  | null     // remaining unparseable phrase
 }
 
@@ -34,6 +41,16 @@ Rules:
 - "mobile app" → devices:["mobile"], surfaces:["app"].
 - "landing page" → surfaces:["website"], tags_any:["landing"].
 - "dark theme" → colors:["dark"].
+- Typography: any mention of font shapes/classes/families goes in typography,
+  NOT in tags. The slot matters — pick headings / bodies / others based on
+  what the query says. If unspecified, place in "headings" (most queries
+  about type are about display type). Lowercase generic class names
+  ("serif", "sans-serif", "mono"); preserve casing on proper font names.
+  Examples:
+    "serif headings"     → typography:{"headings":["serif"]}
+    "sans-serif body"    → typography:{"bodies":["sans-serif"]}
+    "in Inter"           → typography:{"headings":["Inter"]}
+    "mono everywhere"    → typography:{"headings":["mono"],"bodies":["mono"]}
 - Color terms include color-family names: "red", "orange", "yellow", "green",
   "teal", "blue", "purple", "pink", "brown", "beige", "gray", "black", "white".
   Plus modifiers: "dark", "light", "warm", "cool". Map shades to their family —
@@ -48,11 +65,19 @@ Rules:
 - Return strict JSON. No prose, no markdown, no comments.
 
 Example:
-  Input: "minimal pricing pages with serifs"
-  Output: {"surfaces":["website"],"styles":["minimal"],"tags_any":["pricing","serif"],"free_text":null}
+  Input: "minimal pricing pages with serif headings"
+  Output: {"surfaces":["website"],"styles":["minimal"],"tags_any":["pricing"],"typography":{"headings":["serif"]},"free_text":null}
 
 Example:
   Input: "dark mobile app dashboards"
   Output: {"surfaces":["app"],"devices":["mobile"],"colors":["dark"],"tags_any":["dashboard"],"free_text":null}
+
+Example:
+  Input: "i want something clean and in sans-serif as heading"
+  Output: {"styles":["clean"],"typography":{"headings":["sans-serif"]},"free_text":null}
+
+Example:
+  Input: "serif headings with sans body"
+  Output: {"typography":{"headings":["serif"],"bodies":["sans-serif"]},"free_text":null}
 
 Now parse this query:

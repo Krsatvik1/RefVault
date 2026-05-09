@@ -281,6 +281,22 @@ extension ScreenshotRecord: Codable {
     }
 }
 
+/// Per-slot typography filter. Each list is optional; missing or empty
+/// means "no constraint on this slot". Values can be generic class names
+/// ("serif", "sans-serif", "mono") or specific font families ("Inter",
+/// "Söhne"). Matched case-insensitively.
+struct TypographyFilter: Codable, Equatable {
+    var headings: [String]?
+    var bodies: [String]?
+    var others: [String]?
+
+    var isEmpty: Bool {
+        (headings ?? []).isEmpty
+            && (bodies ?? []).isEmpty
+            && (others ?? []).isEmpty
+    }
+}
+
 /// Structured filter parsed from a natural-language search query by Gemma.
 /// Every field is optional; `nil` or `[]` means "no constraint on this axis".
 struct SearchFilter: Codable, Equatable {
@@ -300,12 +316,16 @@ struct SearchFilter: Codable, Equatable {
     var tagsAny: [String]?
     /// Color descriptors — "dark", "warm", or hex strings.
     var colors: [String]?
+    /// Slot-qualified typography filter. A single record can have a
+    /// serif heading AND a sans-serif body, so a flat list loses the
+    /// nuance — the slot is what the user actually filters on.
+    var typography: TypographyFilter?
     /// Anything Gemma couldn't fit in a structured field — applied as
     /// substring match across the haystack.
     var freeText: String?
 
     enum CodingKeys: String, CodingKey {
-        case surfaces, devices, orientations, styles, moods, colors
+        case surfaces, devices, orientations, styles, moods, colors, typography
         case tagsAll = "tags_all"
         case tagsAny = "tags_any"
         case freeText = "free_text"
@@ -313,11 +333,13 @@ struct SearchFilter: Codable, Equatable {
 
     var isEmpty: Bool {
         let lists: [[String]?] = [
-            surfaces, devices, orientations, styles, moods, tagsAll, tagsAny, colors
+            surfaces, devices, orientations, styles, moods,
+            tagsAll, tagsAny, colors
         ]
         let anyList = lists.contains { ($0 ?? []).isEmpty == false }
+        let typoEmpty = (typography?.isEmpty ?? true)
         let hasFree = (freeText ?? "").trimmingCharacters(in: .whitespaces).isEmpty == false
-        return !anyList && !hasFree
+        return !anyList && typoEmpty && !hasFree
     }
 }
 
