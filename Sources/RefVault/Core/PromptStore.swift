@@ -4,7 +4,7 @@ import Foundation
 enum PromptStore {
     static func load(_ name: String) throws -> String {
         // SwiftPM puts resources under Bundle.module.
-        if let url = Bundle.module.url(
+        if let url = Bundle.refvaultResources.url(
             forResource: name,
             withExtension: "txt",
             subdirectory: "Resources/prompts"

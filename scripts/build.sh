@@ -82,7 +82,17 @@ mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
 # com.apple.provenance to every file.
 ditto --norsrc --noextattr --noacl "$BIN" "$APP/Contents/MacOS/$APP_NAME"
 chmod +x "$APP/Contents/MacOS/$APP_NAME"
+
+# SwiftPM resource bundle. Lives in Contents/Resources/ where macOS
+# wants it and codesign accepts it. SwiftPM's auto-generated
+# `Bundle.module` accessor would expect this at the .app root (it uses
+# Bundle.main.bundleURL not resourceURL), but codesign refuses any
+# unsealed contents at the bundle root, so we can't put it there.
+# The custom `Bundle.refvaultResources` accessor in
+# Sources/RefVault/Core/RefVaultResources.swift resolves the bundle
+# from Bundle.main.resourceURL — i.e. this exact path — instead.
 ditto --norsrc --noextattr --noacl "$RESOURCE_BUNDLE" "$APP/Contents/Resources/$(basename "$RESOURCE_BUNDLE")"
+
 ditto --norsrc --noextattr --noacl "$OLLAMA_BIN" "$APP/Contents/Resources/ollama"
 chmod +x "$APP/Contents/Resources/ollama"
 

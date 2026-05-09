@@ -32,11 +32,11 @@ final class RefVaultAppDelegate: NSObject, NSApplicationDelegate {
         // don't ship an Asset Catalog. PNG @1024 is the recommended source
         // — macOS scales it down for the dock and the application
         // switcher and applies the rounded-square mask itself.
-        let appIconURL = Bundle.module.url(
+        let appIconURL = Bundle.refvaultResources.url(
             forResource: "AppIcon",
             withExtension: "png",
             subdirectory: "Resources/icons"
-        ) ?? Bundle.module.url(
+        ) ?? Bundle.refvaultResources.url(
             forResource: "AppIcon",
             withExtension: "png"
         )
@@ -92,11 +92,11 @@ final class RefVaultAppDelegate: NSObject, NSApplicationDelegate {
         // monochrome black on transparent for templating to work right.
         let menuIcon: NSImage? = {
             for ext in ["svg", "pdf", "png"] {
-                let url = Bundle.module.url(
+                let url = Bundle.refvaultResources.url(
                     forResource: "MenuBarIcon",
                     withExtension: ext,
                     subdirectory: "Resources/icons"
-                ) ?? Bundle.module.url(
+                ) ?? Bundle.refvaultResources.url(
                     forResource: "MenuBarIcon",
                     withExtension: ext
                 )
