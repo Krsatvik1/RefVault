@@ -47,11 +47,15 @@ final class ToastPanel: NSPanel {
         ]
     }
 
-    // Notification panel must NOT become key — would steal focus from
-    // whatever the user is doing and re-tie the panel to the active
-    // Space, undoing the CGS-space cross-Space placement.
-    override var canBecomeKey: Bool { false }
-    override var canBecomeMain: Bool { false }
+    // Allow key / main so reattachToCurrentSpace can call makeKey() on
+    // a Space change. The combination of `.nonactivatingPanel` +
+    // `hidesOnDeactivate = false` already prevents the toast from
+    // activating RefVault or stealing keyboard input from the foreground
+    // app — makeKey here just anchors the panel to the WindowServer's
+    // redraw schedule across the Space transition so it re-composites
+    // inside the same frame as the swipe instead of flickering.
+    override var canBecomeKey: Bool { true }
+    override var canBecomeMain: Bool { true }
 }
 
 /// Hosting view used by the toast: routes mouse-down to one of two
@@ -291,6 +295,17 @@ final class ToastPresenter: NSObject, ObservableObject {
         members.insert(panel)
         NotchSpaceManager.shared.notchSpace.windows = members
         panel.orderFrontRegardless()
+        // Match the island: makeKey after orderFrontRegardless on Space
+        // change. Without this the toast briefly disappears and re-
+        // composites during fullscreen-app swipes — the WindowServer
+        // un-layers the panel during the transition and our reattach
+        // happens in the next frame. makeKey ties the redraw to the
+        // same frame as the Space change so the re-composite is
+        // invisible. Safe because `.nonactivatingPanel` keeps RefVault
+        // from activating, and `canBecomeKey = true` (in ToastPanel)
+        // doesn't pull keyboard input away from the foreground app —
+        // that's controlled by app activation, not key window status.
+        panel.makeKey()
         log("Space changed — re-attached panel, members=\(NotchSpaceManager.shared.notchSpace.windows.count)")
     }
 
