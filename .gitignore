@@ -48,6 +48,10 @@ fastlane/test_output
 *.db
 ollama-models/
 
+# Build pipeline outputs
+dist/
+Vendored/
+
 # Editor
 .vscode/
 .idea/

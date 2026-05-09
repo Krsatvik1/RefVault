@@ -11,7 +11,17 @@ final class RefVaultAppDelegate: NSObject, NSApplicationDelegate {
     var statusItem: NSStatusItem?
     var island: IslandPresenter?
     var toast: ToastPresenter?
+    /// Set by RefVaultApp.onAppear so we can shut the supervised Ollama
+    /// daemon down on quit. If we leak the child process, it keeps the
+    /// 26B weights mmap'd and pinned — bad for the next launch's RAM
+    /// footprint and worse for the user who can't see why their Mac is
+    /// using 16GB after closing the app.
+    var bootstrap: AppBootstrap?
     private var globalDismissMonitor: Any?
+
+    func applicationWillTerminate(_ notification: Notification) {
+        bootstrap?.shutdown()
+    }
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         NSApp.setActivationPolicy(.regular)
@@ -82,11 +92,6 @@ final class RefVaultAppDelegate: NSObject, NSApplicationDelegate {
         // monochrome black on transparent for templating to work right.
         let menuIcon: NSImage? = {
             for ext in ["svg", "pdf", "png"] {
-                // Try subdirectory lookup first (most reliable with
-                // SwiftPM's .copy rule), then a bare-name search that
-                // walks the bundle recursively. Either path works once
-                // the file is in place; covers both layouts in case the
-                // bundle flattens differently across Xcode/CLI builds.
                 let url = Bundle.module.url(
                     forResource: "MenuBarIcon",
                     withExtension: ext,
@@ -174,149 +179,183 @@ final class RefVaultAppDelegate: NSObject, NSApplicationDelegate {
 struct RefVaultApp: App {
     @NSApplicationDelegateAdaptor(RefVaultAppDelegate.self) var appDelegate
 
+    @StateObject private var bootstrap: AppBootstrap
     @StateObject private var store: LibraryStore
     @StateObject private var watcher = ScreenshotWatcher()
     @StateObject private var coordinator: IngestionCoordinator
     @StateObject private var searchModel = SearchModel()
 
     init() {
+        let bootstrap = AppBootstrap()
         let store = LibraryStore()
-        let agent = GemmaAgent(client: OllamaClient())
+        // Point the OllamaClient at the supervised daemon's URL up front.
+        // The supervisor binds a fixed port (11535), so the URL is known
+        // at init time even though the daemon isn't reachable yet — the
+        // first call goes through once the bootstrap phase flips to
+        // .ready, and SetupView gates MainWindow until that happens.
+        let agent = GemmaAgent(client: OllamaClient(baseURL: bootstrap.supervisor.baseURL))
         let coordinator = IngestionCoordinator(store: store, agent: agent)
+        _bootstrap = StateObject(wrappedValue: bootstrap)
         _store = StateObject(wrappedValue: store)
         _coordinator = StateObject(wrappedValue: coordinator)
     }
 
     var body: some Scene {
         WindowGroup("RefVault") {
-            MainWindow()
-                .frame(minWidth: 960, minHeight: 600)
+            // Gate MainWindow behind the bootstrap. Until the supervised
+            // Ollama is up AND the 26B model is on disk, render the
+            // setup view (daemon spinner / model download progress).
+            // Without this gate the app would race the daemon on cold
+            // install: every Gemma call would time out for 8+ minutes
+            // and the UI would look frozen.
+            Group {
+                if case .ready = bootstrap.phase {
+                    MainWindow()
+                        .environmentObject(store)
+                        .environmentObject(coordinator)
+                        .environmentObject(watcher)
+                        .environmentObject(searchModel)
+                        .onAppear { setupAfterReady() }
+                } else {
+                    SetupView(bootstrap: bootstrap)
+                }
+            }
+            .frame(minWidth: 960, minHeight: 600)
+            .onAppear {
+                // Always-run: kick the supervisor exactly once. Stash a
+                // ref on the delegate so applicationWillTerminate can
+                // shut the daemon down cleanly on quit.
+                if appDelegate.bootstrap == nil {
+                    appDelegate.bootstrap = bootstrap
+                    bootstrap.start()
+                }
+                DispatchQueue.main.async {
+                    NSApp.activate(ignoringOtherApps: true)
+                    NSApp.windows.first?.makeKeyAndOrderFront(nil)
+                }
+            }
+        }
+    }
+
+    /// Runs the moment MainWindow first appears (i.e. bootstrap flipped
+    /// to .ready). Everything in here assumes the daemon is up and the
+    /// model is on disk — no point preloading or wiring the watcher
+    /// while the model is still pulling.
+    @MainActor
+    private func setupAfterReady() {
+        startWatching()
+        if searchModel.parser == nil {
+            // 26b only — no model swaps. Pinning a smaller model alongside
+            // (e2b/e4b) caused two problems: memory contention on the
+            // 24GB Mac (swap-thrash when both want keep_alive=-1) and
+            // cross-model weight juggling between every ingest and search
+            // call. Both go away when search rides the same warm 26b that
+            // ingestion uses.
+            searchModel.parser = SearchParser(
+                client: coordinator.agent.client,
+                vocabularyProvider: { [weak store] in
+                    store?.vocabulary
+                }
+            )
+        }
+        // Pre-warm 26b so the user's first ingest / regen / search
+        // doesn't pay the ~55s cold-load.
+        Task.detached { [client = coordinator.agent.client] in
+            try? await client.preload()
+        }
+        // Backfill SHA + dHash for any records persisted before dedup
+        // landed. Without this, dropping the same image again wouldn't
+        // be detected as a dup because old records have nil hashes.
+        Task { [weak store] in
+            await store?.backfillHashesIfNeeded()
+        }
+        DispatchQueue.main.async {
+            NSApp.activate(ignoringOtherApps: true)
+            NSApp.windows.first?.makeKeyAndOrderFront(nil)
+        }
+        // Install must run BEFORE wiring onSaved so the diagnostic log
+        // accurately reports the toast presenter state and the closure
+        // has something to talk to from the very first save.
+        if appDelegate.island == nil {
+            // Capture the concrete delegate. Going through
+            // `NSApp.delegate as? RefVaultAppDelegate` was silently
+            // returning nil at click time — likely a SwiftUI
+            // `@NSApplicationDelegateAdaptor` proxy-wrapping detail.
+            // The captured reference bypasses the runtime cast entirely.
+            let delegateRef = appDelegate
+            let close: () -> Void = { [weak delegateRef] in
+                delegateRef?.island?.hide()
+            }
+            let content = MenuBarContent(onClose: close)
                 .environmentObject(store)
                 .environmentObject(coordinator)
                 .environmentObject(watcher)
                 .environmentObject(searchModel)
-                .onAppear {
-                    startWatching()
-                    if searchModel.parser == nil {
-                        // 26b only — no model swaps. Pinning a smaller
-                        // model alongside (e2b/e4b) caused two problems:
-                        // memory contention on the 24GB Mac (swap-thrash
-                        // when both want keep_alive=-1) and cross-model
-                        // weight juggling between every ingest and search
-                        // call. Both go away when search rides the same
-                        // warm 26b that ingestion uses.
-                        searchModel.parser = SearchParser(
-                            client: coordinator.agent.client,
-                            vocabularyProvider: { [weak store] in
-                                store?.vocabulary
-                            }
-                        )
-                    }
-                    // Pre-warm 26b so the user's first ingest / regen /
-                    // search doesn't pay the ~55s cold-load.
-                    Task.detached { [client = coordinator.agent.client] in
-                        try? await client.preload()
-                    }
-                    // Backfill SHA + dHash for any records persisted
-                    // before dedup landed. Without this, dropping the
-                    // same image again wouldn't be detected as a dup
-                    // because old records have nil hashes.
-                    Task { [weak store] in
-                        await store?.backfillHashesIfNeeded()
-                    }
-                    DispatchQueue.main.async {
-                        NSApp.activate(ignoringOtherApps: true)
-                        NSApp.windows.first?.makeKeyAndOrderFront(nil)
-                    }
-                    // Install must run BEFORE wiring onSaved so the
-                    // diagnostic log accurately reports the toast presenter
-                    // state and the closure has something to talk to from
-                    // the very first save.
-                    if appDelegate.island == nil {
-                        // Capture the concrete delegate. Going through
-                        // `NSApp.delegate as? RefVaultAppDelegate` was
-                        // silently returning nil at click time — likely a
-                        // SwiftUI `@NSApplicationDelegateAdaptor`
-                        // proxy-wrapping detail. The captured reference
-                        // bypasses the runtime cast entirely.
-                        let delegateRef = appDelegate
-                        let close: () -> Void = { [weak delegateRef] in
-                            delegateRef?.island?.hide()
-                        }
-                        let content = MenuBarContent(onClose: close)
-                            .environmentObject(store)
-                            .environmentObject(coordinator)
-                            .environmentObject(watcher)
-                            .environmentObject(searchModel)
-                        appDelegate.install(island: content)
-                    }
-                    // Wire AFTER install so the toast presenter exists at
-                    // both wire-time and fire-time. Closure captures
-                    // appDelegate / store / coordinator weakly so it stays
-                    // safe across window lifecycle.
-                    FileHandle.standardError.write(Data(
-                        "[Toast] wiring coordinator.onSaved — toast presenter=\(appDelegate.toast != nil ? "exists" : "NIL")\n".utf8
-                    ))
-                    coordinator.onSaved = { [weak appDelegate, weak store, weak coordinator] saved, elapsed, kind in
-                        guard let toast = appDelegate?.toast else {
-                            FileHandle.standardError.write(Data(
-                                "[Toast] onSaved fired but appDelegate.toast is nil — install never ran?\n".utf8
-                            ))
-                            return
-                        }
-                        let payload = ToastPayload(
-                            thumbnailURL: store?.storedImageURL(for: saved),
-                            style: saved.metadata?.style ?? saved.relevance.surface,
-                            layout: saved.metadata?.layout ?? "",
-                            tags: saved.metadata?.tags ?? [],
-                            processingSeconds: elapsed,
-                            queueCount: max(0, (coordinator?.totalInProgress ?? 1) - 1),
-                            kind: kind == .regenerate ? .regenerate : .ingest
-                        )
-                        FileHandle.standardError.write(Data(
-                            "[Toast] onSaved fired kind=\(kind == .regenerate ? "regenerate" : "ingest") → presenter.show\n".utf8
-                        ))
-                        toast.show(payload)
-                    }
-                    // Duplicate skip — surface the existing record so the
-                    // user gets feedback that their drop wasn't lost.
-                    coordinator.onDuplicate = { [weak appDelegate, weak store, weak coordinator] newURL, matches, reason in
-                        guard let toast = appDelegate?.toast else { return }
-                        let hamming: Int?
-                        switch reason {
-                        case .exact: hamming = nil
-                        case .visual(let h): hamming = h
-                        }
-                        // Resolve each match's stored image URL up front so
-                        // the toast view doesn't need to reach into the
-                        // store at render time.
-                        let matchURLs: [URL] = matches.compactMap { rec in
-                            store?.storedImageURL(for: rec)
-                        }
-                        let saveAnyway: () -> Void = { [weak coordinator] in
-                            coordinator?.enqueueBypassingDedup(newURL)
-                        }
-                        let payload = ToastPayload(
-                            thumbnailURL: matchURLs.first,
-                            style: matches.first?.metadata?.style
-                                ?? matches.first?.relevance.surface ?? "",
-                            layout: matches.first?.metadata?.layout ?? "",
-                            tags: matches.first?.metadata?.tags ?? [],
-                            processingSeconds: nil,
-                            queueCount: max(0, (coordinator?.totalInProgress ?? 0)),
-                            kind: .duplicate(
-                                newImageURL: newURL,
-                                matches: matchURLs,
-                                hamming: hamming,
-                                onSaveAnyway: saveAnyway
-                            )
-                        )
-                        FileHandle.standardError.write(Data(
-                            "[Toast] onDuplicate fired reason=\(hamming.map { "visual h=\($0)" } ?? "exact") matches=\(matches.count) → presenter.show\n".utf8
-                        ))
-                        toast.show(payload)
-                    }
-                }
+            appDelegate.install(island: content)
+        }
+        // Wire AFTER install so the toast presenter exists at both
+        // wire-time and fire-time. Closure captures appDelegate / store /
+        // coordinator weakly so it stays safe across window lifecycle.
+        FileHandle.standardError.write(Data(
+            "[Toast] wiring coordinator.onSaved — toast presenter=\(appDelegate.toast != nil ? "exists" : "NIL")\n".utf8
+        ))
+        coordinator.onSaved = { [weak appDelegate, weak store, weak coordinator] saved, elapsed, kind in
+            guard let toast = appDelegate?.toast else {
+                FileHandle.standardError.write(Data(
+                    "[Toast] onSaved fired but appDelegate.toast is nil — install never ran?\n".utf8
+                ))
+                return
+            }
+            let payload = ToastPayload(
+                thumbnailURL: store?.storedImageURL(for: saved),
+                style: saved.metadata?.style ?? saved.relevance.surface,
+                layout: saved.metadata?.layout ?? "",
+                tags: saved.metadata?.tags ?? [],
+                processingSeconds: elapsed,
+                queueCount: max(0, (coordinator?.totalInProgress ?? 1) - 1),
+                kind: kind == .regenerate ? .regenerate : .ingest
+            )
+            FileHandle.standardError.write(Data(
+                "[Toast] onSaved fired kind=\(kind == .regenerate ? "regenerate" : "ingest") → presenter.show\n".utf8
+            ))
+            toast.show(payload)
+        }
+        // Duplicate skip — surface the existing record so the user gets
+        // feedback that their drop wasn't lost.
+        coordinator.onDuplicate = { [weak appDelegate, weak store, weak coordinator] newURL, matches, reason in
+            guard let toast = appDelegate?.toast else { return }
+            let hamming: Int?
+            switch reason {
+            case .exact: hamming = nil
+            case .visual(let h): hamming = h
+            }
+            // Resolve each match's stored image URL up front so the toast
+            // view doesn't need to reach into the store at render time.
+            let matchURLs: [URL] = matches.compactMap { rec in
+                store?.storedImageURL(for: rec)
+            }
+            let saveAnyway: () -> Void = { [weak coordinator] in
+                coordinator?.enqueueBypassingDedup(newURL)
+            }
+            let payload = ToastPayload(
+                thumbnailURL: matchURLs.first,
+                style: matches.first?.metadata?.style
+                    ?? matches.first?.relevance.surface ?? "",
+                layout: matches.first?.metadata?.layout ?? "",
+                tags: matches.first?.metadata?.tags ?? [],
+                processingSeconds: nil,
+                queueCount: max(0, (coordinator?.totalInProgress ?? 0)),
+                kind: .duplicate(
+                    newImageURL: newURL,
+                    matches: matchURLs,
+                    hamming: hamming,
+                    onSaveAnyway: saveAnyway
+                )
+            )
+            FileHandle.standardError.write(Data(
+                "[Toast] onDuplicate fired reason=\(hamming.map { "visual h=\($0)" } ?? "exact") matches=\(matches.count) → presenter.show\n".utf8
+            ))
+            toast.show(payload)
         }
     }
 

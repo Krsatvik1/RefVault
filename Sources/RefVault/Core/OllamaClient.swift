@@ -1,16 +1,21 @@
 import Foundation
 
-/// Minimal HTTP client for Ollama running on localhost:11434.
+/// Minimal HTTP client for Ollama.
 ///
 /// Uses /api/generate with `format: "json"` so Gemma is forced to return JSON.
 /// Vision models accept a `images` field of base64-encoded image strings.
+///
+/// `baseURL` is `var` because the bundled-Ollama supervisor binds to a
+/// dynamic port (so we don't collide with a user-installed Ollama on the
+/// default 11434). The supervisor publishes its URL after `ollama serve`
+/// is reachable, and we mutate every active client to point at it.
 struct OllamaClient {
-    let baseURL: URL
+    var baseURL: URL
     var model: String
     let session: URLSession
 
     init(
-        baseURL: URL = URL(string: "http://localhost:11434")!,
+        baseURL: URL = OllamaClient.defaultBaseURL,
         model: String = OllamaClient.defaultModel,
         session: URLSession = .shared
     ) {
@@ -18,6 +23,11 @@ struct OllamaClient {
         self.model = model
         self.session = session
     }
+
+    /// URL the client points at before the supervisor reports its real
+    /// port. Matches the system-Ollama default so dev runs work even when
+    /// the supervisor is disabled.
+    static let defaultBaseURL = URL(string: "http://127.0.0.1:11434")!
 
     /// Default model used when no override is supplied. 26b MoE is the
     /// only model the app ships with — earlier we exposed e2b/e4b as

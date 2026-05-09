@@ -1,0 +1,95 @@
+# Builds RefVault.dmg on every push to main and replaces the rolling
+# `latest` GitHub release with the fresh artifact.
+#
+# Why a rolling `latest` instead of versioned tags: during active
+# development we want one stable download URL
+# (github.com/.../releases/latest) that always points at the most recent
+# build. When we cut real releases later, we'll add a separate
+# tag-triggered job that produces v0.1.0, v0.2.0, etc. without touching
+# this rolling artifact.
+
+name: Build and release
+
+on:
+  push:
+    branches: [main]
+  # Manual trigger for builds without pushing — handy when iterating on
+  # the workflow itself or producing a one-off artifact from a feature
+  # branch via the GitHub UI.
+  workflow_dispatch:
+
+# Releases require write access to repo contents (creating tags +
+# uploading assets). Default GITHUB_TOKEN has read-only — bump it.
+permissions:
+  contents: write
+
+jobs:
+  build:
+    # macos-14 = Apple Silicon runner. Required because we build for
+    # arm64 only (Designers' Macs in 2026 are all M-series). Switching
+    # to a universal binary would mean macos-13 + lipo, more complex
+    # for no real-world benefit.
+    runs-on: macos-14
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # Pin Xcode so the toolchain is stable across runs. macos-14
+      # runners ship multiple Xcode versions; without selecting one,
+      # GitHub may bump us mid-release-train.
+      - name: Select Xcode
+        run: sudo xcode-select -s /Applications/Xcode_15.4.app
+
+      # Compose a human-readable version string so the resulting .app's
+      # CFBundleShortVersionString reflects the commit. Format:
+      # YYYYMMDD-HHMM-shortsha. Build number is the GH Actions run
+      # number — monotonically increasing per workflow.
+      - name: Compute version
+        id: version
+        run: |
+          VERSION="$(date -u +%Y%m%d-%H%M)-${GITHUB_SHA::7}"
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+
+      - name: Build DMG
+        env:
+          REFVAULT_VERSION: ${{ steps.version.outputs.version }}
+          REFVAULT_BUILD: ${{ github.run_number }}
+        run: ./scripts/build.sh
+
+      # Always upload as a workflow artifact (separate from the
+      # release). Useful for debugging when a release upload fails or
+      # when the user wants the .dmg from a feature-branch run that
+      # didn't trigger a release.
+      - name: Upload DMG as workflow artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: RefVault-${{ steps.version.outputs.version }}
+          path: dist/RefVault.dmg
+          if-no-files-found: error
+          retention-days: 14
+
+      # Replace the rolling `latest` release. softprops/action-gh-release
+      # creates the tag if missing or moves it if present, then
+      # re-uploads the asset. Marked as prerelease=false so the
+      # GitHub UI surfaces it as the latest stable on the repo page.
+      - name: Update `latest` release
+        if: github.event_name == 'push' || github.event_name == 'workflow_dispatch'
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: latest
+          name: Latest build
+          body: |
+            Auto-built from [`${{ github.sha }}`](https://github.com/${{ github.repository }}/commit/${{ github.sha }}) at ${{ steps.version.outputs.version }}.
+
+            ## Install
+            1. Download `RefVault.dmg` below.
+            2. Open it and drag `RefVault` into `Applications`.
+            3. First launch will be blocked — open System Settings → Privacy & Security → click **Open Anyway**, then re-launch.
+            4. The app will download Gemma 4 26B (~15 GB) on first run; this is normal.
+          files: dist/RefVault.dmg
+          prerelease: false
+          # `latest` tag rolls forward on every push — let GitHub mark
+          # this as the repo's latest release so the .../releases/latest
+          # URL is always the most recent build.
+          make_latest: "true"
