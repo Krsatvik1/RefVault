@@ -6,7 +6,8 @@
 
 <p align="center">
   The local-first design reference vault for Mac.<br />
-  Drop a screenshot. <b>Gemma 4 26B</b> tags it. Search it later by sentence.
+  Drop a screenshot. <b>Gemma 4 26B</b> tags it. Search it later by sentence.<br />
+  <sub>It organizes your UI inspiration while you're busy looking for it — just take a screenshot, RefVault handles the rest.</sub>
 </p>
 
 <p align="center">
@@ -17,24 +18,28 @@
 ---
 
 <p align="center">
-  <img src="docs/images/toast-saved.png" width="720" alt="RefVault save toast on the desktop" />
+  <img src="docs/images/hero.png" width="100%" alt="RefVault library" />
 </p>
-
-<p align="center"><i>A new screenshot lands. RefVault tags it and slides a Dynamic-Island-style toast in the corner — then gets out of your way.</i></p>
 
 ## Demo
 
-<video src="https://github.com/Krsatvik1/RefVault/raw/main/docs/dynamicIsland.mp4" controls width="100%"></video>
+<video src="https://github.com/Krsatvik1/RefVault/raw/main/docs/gemma-demo_2.mp4" controls width="100%"></video>
 
-If the video doesn't play inline, [open it directly](docs/dynamicIsland.mp4).
+If the video doesn't play inline, [open it directly](docs/gemma-demo_2.mp4).
 
 ---
 
+## Why I built this
+
+I'm a designer. I'm constantly going through websites for inspiration — bookmarking pages, saving Pinterest pins, screenshotting Dribbble shots and landing pages I want to come back to. By the time I actually need that reference for a project, none of it is where I left it. The bookmark is in the wrong browser. The Pinterest board got reorganized. The screenshot is buried on my Desktop with a useless name like `Screenshot 2026-05-08 at 4.24.26 AM.png`.
+
+RefVault is the thing I built so I'd stop losing references. Take a screenshot — that's it. Gemma 4 26B reads it locally, tags it, files it. When I'm searching weeks later for *"minimal pricing serif"* or *"i want some illustration references"*, the screenshot is right there.
+
 ## What it does
 
-You point RefVault at a folder. Every time a screenshot lands there — Cmd-Shift-4, a save from Pinterest, an export from Paper — Gemma 4 26B reads the image and pulls out everything that matters about a design reference: palette, typography, mood, layout, tags, and the URL on screen if it's a browser shot.
+You point RefVault at a folder. By default it watches **`~/Desktop`** — where macOS drops every Cmd-Shift-4 screenshot — but you can add any folder you want.
 
-Then it shows up in your library, tagged, ready to find again.
+Every time a screenshot lands there, **Gemma 4 26B** reads the image and pulls out everything that matters about a design reference: palette, typography, mood, layout, tags, and the URL on screen if it's a browser shot. Then it shows up in your library, tagged, ready to find again.
 
 It runs entirely on your Mac. Nothing leaves the machine.
 
@@ -57,6 +62,8 @@ The search bar takes a real sentence. Gemma rewrites it into a structured query 
 
 A toast slides in when something's saved. If you've already got that screenshot, it asks before duping. If something gets re-indexed, you see that too.
 
+<video src="https://github.com/Krsatvik1/RefVault/raw/main/docs/dynamicIsland.mp4" controls width="100%"></video>
+
 <table>
   <tr>
     <td><img src="docs/images/toast-saved.png" alt="saved toast" /></td>
@@ -72,7 +79,7 @@ A toast slides in when something's saved. If you've already got that screenshot,
 
 ## Tune the way it sees
 
-Choose which `gemma4` model handles indexing, raise or lower the relevance threshold (false positives vs. missed references), and reveal the library folder in Finder.
+Raise or lower the relevance threshold (false positives vs. missed references), pick which folders RefVault watches, and reveal the library folder in Finder.
 
 <p align="center">
   <img src="docs/images/settings.png" width="900" alt="RefVault settings panel" />
@@ -149,13 +156,33 @@ The quarantine value format is `<flags>;<timestamp_hex>;<agent>;<uuid?>` — the
 
 ---
 
-## Powered by Gemma 4 26B, on-device
+## How RefVault uses Gemma 4 26B
 
-Every save runs through **Gemma 4 26B** locally via a bundled Ollama runtime. The 26B MoE variant runs cleanly on M-series Macs and gets palette, typography, and mood right where smaller variants would slip — earlier builds used `gemma4:e4b` for speed and the library got noisy. Indexing happens once in the background, so size matters more than speed.
-
-Search uses the same model: a short prompt rewrites your sentence into a structured filter, then the local SQLite library does the rest. One model call per query, results stay snappy.
+Every save runs through **Gemma 4 26B** locally via a bundled Ollama runtime. The 26B MoE variant runs cleanly on M-series Macs. Search uses the same model: a short prompt rewrites your sentence into a structured filter, then the local SQLite library does the rest.
 
 Nothing leaves your Mac.
+
+### Parallel + granular extraction
+
+Instead of one mega-prompt asking Gemma "tell me everything about this image," RefVault splits the job into focused, **independent calls** — one for palette, one for typography, one for mood, one for layout, one for tags, one for the visible URL — and runs them **in parallel**. Each prompt is small and specific, which keeps Gemma honest (it can't shortcut a sub-task by giving up on just that one), and the parallel calls share Ollama's warm KV cache so total wall-clock time barely grows.
+
+I A/B'd this against a single combined prompt and a serial-granular variant inside the in-app Debug view:
+
+<p align="center">
+  <img src="docs/images/parallel-vs-granular.png" width="100%" alt="Parallel + granular vs. combined prompt benchmark" />
+</p>
+
+The parallel + granular pipeline produced consistently sharper per-field outputs than a single combined call, with comparable wall-clock time on the M4.
+
+### Why 26B, not 4B
+
+Earlier builds ran on `gemma4:e4b` for speed. It's faster, but palette, typography, and mood came back wrong often enough that the library got noisy. The 26B variant produces tags I trust on the first read.
+
+<p align="center">
+  <img src="docs/images/gemma4-4b-vs-26b.png" width="100%" alt="gemma4 e4b vs 26b on the same image" />
+</p>
+
+Same image, same prompts. The 26B output recognizes "high-end, editorial" mood and richer layout language ("modern, sophisticated, large-scale-typography, monochromatic, asymmetric, minimalist") where the 4B variant returns thinner, generic tags. Indexing happens once in the background, so model size matters more than raw speed for this use case.
 
 ### Performance
 
@@ -164,7 +191,7 @@ Tested on a **MacBook Air M4 with 24 GB RAM**:
 - **Indexing:** ~60–100 seconds per screenshot (one-time, in the background)
 - **Search:** ~20 seconds per query (one Gemma call to parse the sentence, then a local SQLite hit)
 
-Both numbers scale with model size and chip — bigger Macs go faster.
+Both scale with model size and chip — bigger Macs go faster.
 
 ---
 
@@ -194,6 +221,6 @@ CI on push to `main` rebuilds the rolling [`latest`](https://github.com/Krsatvik
 ---
 
 <p align="center">
-  Created for the <a href="https://dev.to/devteam/join-the-gemma-4-challenge-3000-prize-pool-for-ten-winners-23in"><b>Google Gemma 4 Challenge</b> on dev.to</a>.<br />
+  Created for <a href="https://dev.to/devteam/join-the-gemma-4-challenge-3000-prize-pool-for-ten-winners-23in"><b>Google's Gemma 4 Challenge</b> on dev.to</a>.<br />
   <sub>MIT · made with care on a MacBook Air M4</sub>
 </p>
