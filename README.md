@@ -61,11 +61,7 @@ The search bar takes a real sentence. Gemma rewrites it into a structured query 
 
 A toast slides in when something's saved. If you've already got that screenshot, it asks before duping. If something gets re-indexed, you see that too.
 
-<!-- TODO: drag docs/dynamicIsland.mp4 into a GitHub issue/PR comment to upload it,
-     then paste the resulting https://github.com/user-attachments/assets/<id> URL
-     on its own line in place of the placeholder below — that's what makes it
-     auto-embed on the rendered README. -->
-https://github.com/user-attachments/assets/REPLACE_ME_DYNAMIC_ISLAND
+https://github.com/user-attachments/assets/b82cf303-24ad-4688-8aa7-099b852573e2
 
 If the video doesn't play inline, [open it directly](docs/dynamicIsland.mp4).
 
