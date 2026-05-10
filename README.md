@@ -82,12 +82,13 @@ https://github.com/user-attachments/assets/b82cf303-24ad-4688-8aa7-099b852573e2
 
 If the video doesn't play inline, [open it directly](docs/dynamicIsland.mp4).
 
+<p align="center">
+  <img src="docs/images/drop.png" width="900" alt="Drop image to add — drag-and-drop overlay on the library" />
+</p>
+
 **Drop in.** Drag any image into the library — from Finder, Safari, Slack, Mail, an email attachment, a browser tab — and RefVault treats it like a screenshot you just took. The library shows an import overlay while you're dragging; release, and Gemma starts indexing.
 
 **Drag out.** Every card in the library is draggable. Pick one up and drop it into Figma, Slack, Mail, or a fresh browser tab — receivers get the actual image file (registered as a real `NSItemProvider` with the on-disk URL), not a thumbnail. The fastest way to pull a saved reference into whatever you're working on.
-
-<!-- TODO: optional — if you record a drag-and-drop demo, upload it the same way
-     and paste the user-attachments URL here. -->
 
 ## Tune the way it sees
 
