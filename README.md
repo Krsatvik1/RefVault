@@ -61,10 +61,6 @@ The search bar takes a real sentence. Gemma rewrites it into a structured query 
 
 A toast slides in when something's saved. If you've already got that screenshot, it asks before duping. If something gets re-indexed, you see that too.
 
-https://github.com/user-attachments/assets/b82cf303-24ad-4688-8aa7-099b852573e2
-
-If the video doesn't play inline, [open it directly](docs/dynamicIsland.mp4).
-
 <table>
   <tr>
     <td><img src="docs/images/toast-saved.png" alt="saved toast" /></td>
@@ -81,6 +77,10 @@ If the video doesn't play inline, [open it directly](docs/dynamicIsland.mp4).
 ## Drag-and-drop, both directions
 
 RefVault is part of your normal workflow, not a separate destination.
+
+https://github.com/user-attachments/assets/b82cf303-24ad-4688-8aa7-099b852573e2
+
+If the video doesn't play inline, [open it directly](docs/dynamicIsland.mp4).
 
 **Drop in.** Drag any image into the library — from Finder, Safari, Slack, Mail, an email attachment, a browser tab — and RefVault treats it like a screenshot you just took. The library shows an import overlay while you're dragging; release, and Gemma starts indexing.
 
