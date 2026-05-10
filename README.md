@@ -61,7 +61,13 @@ The search bar takes a real sentence. Gemma rewrites it into a structured query 
 
 A toast slides in when something's saved. If you've already got that screenshot, it asks before duping. If something gets re-indexed, you see that too.
 
-<video src="https://github.com/Krsatvik1/RefVault/raw/main/docs/dynamicIsland.mp4" controls width="100%"></video>
+<!-- TODO: drag docs/dynamicIsland.mp4 into a GitHub issue/PR comment to upload it,
+     then paste the resulting https://github.com/user-attachments/assets/<id> URL
+     on its own line in place of the placeholder below — that's what makes it
+     auto-embed on the rendered README. -->
+https://github.com/user-attachments/assets/REPLACE_ME_DYNAMIC_ISLAND
+
+If the video doesn't play inline, [open it directly](docs/dynamicIsland.mp4).
 
 <table>
   <tr>
@@ -75,6 +81,17 @@ A toast slides in when something's saved. If you've already got that screenshot,
     <td align="center"><sub>Refreshed</sub></td>
   </tr>
 </table>
+
+## Drag-and-drop, both directions
+
+RefVault is part of your normal workflow, not a separate destination.
+
+**Drop in.** Drag any image into the library — from Finder, Safari, Slack, Mail, an email attachment, a browser tab — and RefVault treats it like a screenshot you just took. The library shows an import overlay while you're dragging; release, and Gemma starts indexing.
+
+**Drag out.** Every card in the library is draggable. Pick one up and drop it into Figma, Slack, Mail, or a fresh browser tab — receivers get the actual image file (registered as a real `NSItemProvider` with the on-disk URL), not a thumbnail. The fastest way to pull a saved reference into whatever you're working on.
+
+<!-- TODO: optional — if you record a drag-and-drop demo, upload it the same way
+     and paste the user-attachments URL here. -->
 
 ## Tune the way it sees
 
