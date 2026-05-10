@@ -21,6 +21,40 @@
   <img src="docs/images/hero.png" width="100%" alt="RefVault library" />
 </p>
 
+## Install
+
+<p align="center">
+  <a href="https://github.com/Krsatvik1/RefVault/releases/latest"><b>↓ Download RefVault.zip</b></a>
+</p>
+
+1. Download the `.zip` from the link above. Safari auto-extracts; other browsers — double-click.
+2. Drag **RefVault.app** into `/Applications`.
+3. First launch will be **blocked**: macOS shows *"Apple could not verify…"*. Click **Done**.
+4. Open **System Settings → Privacy & Security**, scroll to Security, click **Open Anyway** next to the RefVault notice.
+
+<p align="center">
+  <img src="docs/images/privacy-security.png" width="700" alt="Privacy & Security: Open Anyway for RefVault" />
+</p>
+
+5. Re-launch from `/Applications`, click **Open** on the confirmation dialog.
+6. The app downloads **Gemma 4 26B** (~15 GB) the first time. One-time, with progress.
+
+<p align="center">
+  <img src="docs/images/setup-download.png" width="600" alt="First-run download of Gemma 4 26B" />
+</p>
+
+That's it. Ollama runtime + the Gemma 4 26B model are managed inside the app — no `brew install`, no `ollama pull`, no terminal.
+
+> **Why "Open Anyway"?** I don't have an Apple Developer account yet ($99/yr), so RefVault is signed ad-hoc instead of with a paid Developer ID. Gatekeeper flags any ad-hoc-signed app on first launch. The "Open Anyway" exception is granted once per install and persists across re-launches.
+
+**Still says "damaged" or "can't be verified"?** Strip the quarantine flag and re-open:
+
+```bash
+xattr -dr com.apple.quarantine /Applications/RefVault.app
+```
+
+---
+
 ## Demo
 https://github.com/user-attachments/assets/b6eeb86b-ecbb-46bf-b0b1-c58362de2fd6
 
@@ -97,54 +131,6 @@ Raise or lower the relevance threshold (false positives vs. missed references), 
 <p align="center">
   <img src="docs/images/settings.png" width="900" alt="RefVault settings panel" />
 </p>
-
----
-
-## Install
-
-<p align="center">
-  <a href="https://github.com/Krsatvik1/RefVault/releases/latest"><b>↓ Download RefVault.zip</b></a>
-</p>
-
-1. Download the `.zip` from the link above. Safari auto-extracts; other browsers — double-click.
-2. Drag **RefVault.app** into `/Applications`.
-3. First launch will be **blocked**: macOS shows *"Apple could not verify…"*. Click **Done**.
-4. Open **System Settings → Privacy & Security**, scroll to Security, click **Open Anyway** next to the RefVault notice.
-
-<p align="center">
-  <img src="docs/images/privacy-security.png" width="700" alt="Privacy & Security: Open Anyway for RefVault" />
-</p>
-
-5. Re-launch from `/Applications`, click **Open** on the confirmation dialog.
-6. The app downloads **Gemma 4 26B** (~15 GB) the first time. One-time, with progress.
-
-<p align="center">
-  <img src="docs/images/setup-download.png" width="600" alt="First-run download of Gemma 4 26B" />
-</p>
-
-That's it. Ollama runtime + the Gemma 4 26B model are managed inside the app — no `brew install`, no `ollama pull`, no terminal.
-
-> **Why "Open Anyway"?** I don't have an Apple Developer account yet ($99/yr), so RefVault is signed ad-hoc instead of with a paid Developer ID. Gatekeeper flags any ad-hoc-signed app on first launch. The "Open Anyway" exception is granted once per install and persists across re-launches.
-
-### `xattr` cheatsheet
-
-```bash
-# Inspect quarantine state on an .app
-xattr -l /Applications/RefVault.app
-
-# Re-attach quarantine to simulate a "fresh download" without re-downloading
-xattr -w com.apple.quarantine \
-    "0181;$(printf '%x' $(date +%s));Safari;" \
-    /Applications/RefVault.app
-
-# Strip quarantine from a build you trust (skips the Gatekeeper prompt)
-xattr -dr com.apple.quarantine /Applications/RefVault.app
-
-# Strip the metadata `codesign` refuses to seal around (used by build.sh)
-xattr -cr /path/to/something
-```
-
-The quarantine value format is `<flags>;<timestamp_hex>;<agent>;<uuid?>` — the value above marks the bundle as just-downloaded by Safari.
 
 ---
 
