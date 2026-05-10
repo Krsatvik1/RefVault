@@ -22,8 +22,7 @@
 </p>
 
 ## Demo
-
-<video src="https://github.com/Krsatvik1/RefVault/raw/main/docs/gemma-demo_2.mp4" controls width="100%"></video>
+https://github.com/user-attachments/assets/b6eeb86b-ecbb-46bf-b0b1-c58362de2fd6
 
 If the video doesn't play inline, [open it directly](docs/gemma-demo_2.mp4).
 
