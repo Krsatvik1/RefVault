@@ -141,17 +141,94 @@ Every save runs through **Gemma 4 26B** locally via a bundled Ollama runtime. Th
 
 Nothing leaves your Mac.
 
-### Parallel + granular extraction
+### Indexing pipeline
 
-Instead of one mega-prompt asking Gemma "tell me everything about this image," RefVault splits the job into focused, **independent calls** — one for palette, one for typography, one for mood, one for layout, one for tags, one for the visible URL — and runs them **in parallel**. Each prompt is small and specific, which keeps Gemma honest (it can't shortcut a sub-task by giving up on just that one), and the parallel calls share Ollama's warm KV cache so total wall-clock time barely grows.
+Every screenshot first goes through a **relevance gate**, then through **extraction** (granular by default, single-prompt as an opt-in benchmark mode).
 
-I A/B'd this against a single combined prompt and a serial-granular variant inside the in-app Debug view:
+#### 1. Relevance gate
+
+[`relevance.txt`](Sources/RefVault/Resources/prompts/relevance.txt) — runs first on every image. If `is_design` is false the screenshot is dropped before any extraction runs.
+
+```text
+You are looking at a screenshot from a designer's screen captures folder.
+
+Decide three things:
+1. Is this a design reference (a website, app UI, poster, typography sample,
+   illustration, color palette, or anything a designer would save for inspiration)?
+   It is NOT design if it's a chat, error, receipt, code editor, document,
+   spreadsheet, or random photo.
+2. What surface is it? "website" | "app" | "poster" | "illustration" | "document" | "other"
+3. What device is the design intended for? "desktop" | "mobile" | "tablet" | "other"
+
+Respond ONLY with this JSON:
+{ "is_design": boolean, "confidence": 0.0 to 1.0, "reason": "...",
+  "looks_like_browser": boolean, "surface": "...", "device": "..." }
+```
+
+#### 2a. Granular extraction (default — parallel)
+
+Instead of one mega-prompt asking Gemma "tell me everything about this image," RefVault splits the job into focused, **independent calls** — one per axis — and runs them **in parallel**. Each prompt is small and specific, which keeps Gemma honest (it can't shortcut a sub-task by giving up on just that one), and the parallel calls share Ollama's warm KV cache so total wall-clock time barely grows.
+
+| axis | prompt | extracts |
+| --- | --- | --- |
+| style | [`metadata_style.txt`](Sources/RefVault/Resources/prompts/metadata_style.txt) | one of `minimal`, `brutalist`, `editorial`, `playful`, … |
+| typography | [`metadata_typography.txt`](Sources/RefVault/Resources/prompts/metadata_typography.txt) | per-slot type (headings / bodies / others) |
+| mood | [`metadata_mood.txt`](Sources/RefVault/Resources/prompts/metadata_mood.txt) | 2–3 adjectives |
+| layout | [`metadata_layout.txt`](Sources/RefVault/Resources/prompts/metadata_layout.txt) | one of `hero`, `pricing`, `dashboard`, `landing`, … |
+| tags | [`metadata_tags.txt`](Sources/RefVault/Resources/prompts/metadata_tags.txt) | 5–15 single-word tags |
+| color | [`colors.txt`](Sources/RefVault/Resources/prompts/colors.txt) | primary / secondary / accent / full palette as hex |
+| url | [`url.txt`](Sources/RefVault/Resources/prompts/url.txt) | the URL on screen — runs only when `looks_like_browser` is true |
+
+A typical granular prompt is short and does exactly one thing. The mood prompt in full:
+
+```text
+Describe the mood of this design reference using 2–3 adjectives.
+
+Return ONLY this JSON:
+{ "mood": "..." }
+
+Examples of good values:
+- "calm, professional, trustworthy"
+- "energetic, playful, vibrant"
+- "luxurious, refined, dark"
+- "warm, friendly, approachable"
+
+Strict JSON, no prose.
+```
+
+#### 2b. Combined non-granular prompt (benchmark mode)
+
+The same code path also supports a single combined prompt that asks for everything in one shot — this is the variant the benchmark below compares against.
+
+[`metadata.txt`](Sources/RefVault/Resources/prompts/metadata.txt):
+
+```text
+You are analyzing a design reference image. Extract structured metadata.
+
+Return ONLY this JSON, no other text:
+{
+  "style": "one of: minimal, maximalist, brutalist, neo-brutalist, editorial,
+           corporate, playful, retro, futuristic, glassmorphic, skeuomorphic, other",
+  "typography": {
+    "headings": ["..."], "bodies": ["..."], "others": ["..."]
+  },
+  "layout": "one of: hero, pricing, dashboard, landing, portfolio, blog,
+            product-detail, navigation, form, modal, mobile-screen, poster,
+            illustration, other",
+  "mood": "2-3 adjectives, comma-separated, e.g. 'calm, professional, trustworthy'",
+  "tags": ["5 to 15 specific single-word tags, no hyphens"]
+}
+
+Use the actual visual evidence. Do not guess if you cannot see something clearly.
+```
+
+I A/B'd granular-parallel against this combined prompt (and against a serial-granular variant) inside the in-app Debug view:
 
 <p align="center">
   <img src="docs/images/parallel-vs-granular.png" width="100%" alt="Parallel + granular vs. combined prompt benchmark" />
 </p>
 
-The parallel + granular pipeline produced consistently sharper per-field outputs than a single combined call, with comparable wall-clock time on the M4.
+The granular-parallel pipeline produced consistently sharper per-field outputs than the single combined call. When forced to answer all axes in one response, the model tends to shortcut the harder ones (mood and typography especially) — separating them keeps each answer crisp.
 
 ### Why 26B, not 4B
 
@@ -162,6 +239,46 @@ Earlier builds ran on `gemma4:e4b` for speed. It's faster, but palette, typograp
 </p>
 
 Same image, same prompts. The 26B output recognizes "high-end, editorial" mood and richer layout language ("modern, sophisticated, large-scale-typography, monochromatic, asymmetric, minimalist") where the 4B variant returns thinner, generic tags. Indexing happens once in the background, so model size matters more than raw speed for this use case.
+
+### Search prompt
+
+Search uses a separate, single-shot prompt. The user's sentence goes in, a structured filter comes out, and the filter runs against the local SQLite library — Gemma is consulted once per query, never per result.
+
+[`search.txt`](Sources/RefVault/Resources/prompts/search.txt) (excerpt):
+
+```text
+You are a search query parser for a design-reference library.
+
+The user typed a natural-language query. Convert it into a structured filter
+that we can apply to records of saved design screenshots. Each record has
+these axes: surface, device, orientation, style, mood, tags, palette, typography.
+
+Return ONLY a JSON object with these keys (omit or null any axis the query
+did not constrain):
+
+{
+  "surfaces": [...] | null, "devices": [...] | null, "orientations": [...] | null,
+  "styles":   [...] | null, "moods":   [...] | null,
+  "tags_all": [...] | null, "tags_any": [...] | null,
+  "colors":   [...] | null,                        // "dark", "warm", "#ff7700"
+  "typography": { "headings": [...], "bodies": [...], "others": [...] } | null,
+  "free_text": string | null                       // remaining unparseable phrase
+}
+
+Examples:
+  Input:  "minimal pricing pages with serif headings"
+  Output: {"surfaces":["website"],"styles":["minimal"],"tags_any":["pricing"],
+           "typography":{"headings":["serif"]},"free_text":null}
+
+  Input:  "dark mobile app dashboards"
+  Output: {"surfaces":["app"],"devices":["mobile"],"colors":["dark"],
+           "tags_any":["dashboard"],"free_text":null}
+
+  Input:  "i want something clean and in sans-serif as heading"
+  Output: {"styles":["clean"],"typography":{"headings":["sans-serif"]},"free_text":null}
+```
+
+The full prompt has more explicit rules (color-family mappings, typography slot routing, when to use `tags_all` vs `tags_any`) and a few-shot block of example translations — see [`search.txt`](Sources/RefVault/Resources/prompts/search.txt) for the unabridged version.
 
 ### Performance
 
