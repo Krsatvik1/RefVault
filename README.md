@@ -113,27 +113,6 @@ That's it. Ollama runtime + the Gemma 4 26B model are managed inside the app —
 
 > **Why "Open Anyway"?** I don't have an Apple Developer account yet ($99/yr), so RefVault is signed ad-hoc instead of with a paid Developer ID. Gatekeeper flags any ad-hoc-signed app on first launch. The "Open Anyway" exception is granted once per install and persists across re-launches.
 
-### Reset the install (for re-testing the Gatekeeper flow)
-
-If you want to capture fresh screenshots of the Privacy & Security flow, or hand the `.zip` to someone else from a clean state:
-
-```bash
-# 1. Quit RefVault
-pkill -x RefVault
-
-# 2. Forget the per-app Gatekeeper exception
-sudo spctl --remove --type execute /Applications/RefVault.app
-
-# 3. Remove the install
-rm -rf /Applications/RefVault.app
-
-# 4. Clear the LaunchServices cache
-/System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister \
-    -r -domain local -domain user
-```
-
-Re-download the `.zip`. Safari attaches `com.apple.quarantine` to the download; the next launch will hit the Gatekeeper block again.
-
 ### `xattr` cheatsheet
 
 ```bash
